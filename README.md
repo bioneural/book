@@ -196,4 +196,4 @@ book is a standalone tool. When used with [prophet](https://github.com/bioneural
 
 ## License
 
-MIT — Kerry Ivan Kurian
+MIT
