@@ -3,7 +3,7 @@
 
 # book — a persistent task queue for autonomous agents
 # https://github.com/bioneural/book
-# MIT License — Copyright (c) 2026 Fort Asset LLC
+# MIT License — Copyright (c) 2026 Kerry Ivan Kurian
 #
 # A prioritized work queue with dispatch, failure handling, and human approval.
 # Tasks survive across sessions. A dispatcher executes them via `claude -p`.
