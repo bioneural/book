@@ -1,0 +1,784 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# book — a persistent task queue for autonomous agents
+# https://github.com/bioneural/book
+# MIT License — Copyright (c) 2026 Fort Asset LLC
+#
+# A prioritized work queue with dispatch, failure handling, and human approval.
+# Tasks survive across sessions. A dispatcher executes them via `claude -p`.
+# Gate blocks create reviews that require human approval before a task resumes.
+#
+# Subcommands:
+#
+#   book init                                  Create database
+#   book add "description" --priority N        Add a task (prints ID)
+#   book list                                  All tasks by priority desc
+#   book next                                  Highest-priority pending/error task
+#   book done ID                               Mark task completed
+#   book fail ID --reason "..."                Mark task unrecoverably failed
+#   book error ID --reason "..."               Mark task as retriable failure
+#   book block ID --gate "reason" --action "d" Policy block — creates a review
+#   book drop ID                               Delete a task
+#   book reprioritize ID --priority N          Change priority
+#   book status                                Counts by state
+#   book reviews                               List pending reviews
+#   book approve ID --as NAME [--notes "..."]  Approve a review, unblock task
+#   book reject ID --as NAME [--notes "..."]   Reject a review, fail task
+#   book dispatch                              Execute next pending/error task
+#   book doctor                                Check prerequisites (JSON)
+#
+# Usage:
+#   bin/book init
+#   bin/book add "deploy staging" --priority 5
+#   bin/book list
+#   bin/book next
+#   bin/book dispatch
+#   bin/book done 1
+#   bin/book fail 1 --reason "host unreachable"
+#   bin/book error 1 --reason "timeout, will retry"
+#   bin/book block 1 --gate "requires approval" --action "deploy to prod"
+#   bin/book reviews
+#   bin/book approve 1 --as kerry --notes "looks good"
+#   bin/book reject 1 --as kerry --notes "not ready"
+#   bin/book status
+#   bin/book doctor
+#
+# Environment:
+#   BOOK_DB    Path to the SQLite database file.
+#              Default: .state/book/book.db (relative to cwd)
+#
+# Output:
+#   add       — task ID on stdout
+#   list      — tab-separated table on stdout
+#   next      — JSON object on stdout (empty string if nothing pending)
+#   status    — tab-separated counts on stdout
+#   reviews   — tab-separated table on stdout
+#   doctor    — JSON on stdout
+#   dispatch  — task result on stdout
+#   others    — confirmation on stderr
+#
+# Dependencies: ruby (stdlib only), sqlite3 (CLI)
+#
+# Behavior:
+#   dispatch:
+#     1. Find highest-priority pending or error task
+#     2. Mark it running
+#     3. Execute via `claude -p` with a structured prompt
+#     4. Parse output for status markers: DONE, BLOCKED, ERROR, FAILED
+#     5. Update task status accordingly
+#     6. If BLOCKED, create a review row for human approval
+#
+# Schema: see the SCHEMA constant below or the README.
+
+require 'json'
+require 'open3'
+require 'fileutils'
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+DB_PATH = ENV.fetch('BOOK_DB') { File.join(Dir.pwd, '.state', 'book', 'book.db') }
+
+SQLITE3 = ENV.fetch('BOOK_SQLITE3') {
+  brew_path = '/opt/homebrew/opt/sqlite/bin/sqlite3'
+  File.executable?(brew_path) ? brew_path : 'sqlite3'
+}
+
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
+
+SCHEMA = <<~SQL
+  CREATE TABLE IF NOT EXISTS tasks (
+    id           INTEGER PRIMARY KEY,
+    description  TEXT NOT NULL,
+    priority     INTEGER DEFAULT 0,
+    status       TEXT DEFAULT 'pending',
+    created_at   TEXT DEFAULT (datetime('now')),
+    started_at   TEXT,
+    completed_at TEXT,
+    result       TEXT,
+    retries      INTEGER DEFAULT 0,
+    max_retries  INTEGER DEFAULT 3
+  );
+
+  CREATE TABLE IF NOT EXISTS reviews (
+    id          INTEGER PRIMARY KEY,
+    task_id     INTEGER REFERENCES tasks(id),
+    gate_reason TEXT NOT NULL,
+    action_desc TEXT NOT NULL,
+    context     TEXT,
+    status      TEXT DEFAULT 'pending',
+    resolved_by TEXT,
+    created_at  TEXT DEFAULT (datetime('now')),
+    resolved_at TEXT,
+    notes       TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS approvals (
+    id           INTEGER PRIMARY KEY,
+    task_id      INTEGER REFERENCES tasks(id),
+    gate_reason  TEXT NOT NULL,
+    description  TEXT NOT NULL,
+    approved_by  TEXT NOT NULL,
+    approved_at  TEXT DEFAULT (datetime('now')),
+    notes        TEXT
+  );
+SQL
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def escape_sql(str)
+  str.to_s.gsub("'", "''")
+end
+
+def sql_exec(query)
+  stdout, stderr, status = Open3.capture3(SQLITE3, DB_PATH, stdin_data: query)
+  unless status.success?
+    $stderr.puts "book: sqlite3 error: #{stderr.strip}"
+    return nil
+  end
+  stdout.strip
+end
+
+def sql_query_json(query)
+  stdout, stderr, status = Open3.capture3(SQLITE3, '-json', DB_PATH, stdin_data: query)
+  unless status.success?
+    $stderr.puts "book: sqlite3 error: #{stderr.strip}"
+    return []
+  end
+  return [] if stdout.strip.empty?
+  JSON.parse(stdout)
+rescue JSON::ParserError => e
+  $stderr.puts "book: JSON parse error: #{e.message}"
+  []
+end
+
+def db_exists?
+  File.exist?(DB_PATH)
+end
+
+def ensure_db_dir
+  dir = File.dirname(DB_PATH)
+  FileUtils.mkdir_p(dir) unless Dir.exist?(dir)
+end
+
+def require_db
+  unless db_exists?
+    $stderr.puts "book: database not found at #{DB_PATH} — run `book init`"
+    exit 1
+  end
+end
+
+def ensure_db
+  return if db_exists?
+  ensure_db_dir
+  sql_exec(SCHEMA)
+end
+
+def parse_flag(args, flag)
+  idx = args.index(flag)
+  return nil unless idx
+  args.delete_at(idx)
+  args.delete_at(idx)
+end
+
+def call_claude(prompt)
+  stdout, status = Open3.capture2('claude', '-p', stdin_data: prompt)
+  unless status.success?
+    $stderr.puts "book: claude -p exited with #{status.exitstatus}"
+    return nil
+  end
+  result = stdout.strip
+  result = result.sub(/\A```\w*\n?/, '').sub(/\n?```\z/, '').strip
+  result
+rescue Errno::ENOENT
+  $stderr.puts 'book: claude CLI not found'
+  nil
+rescue => e
+  $stderr.puts "book: claude -p failed: #{e.message}"
+  nil
+end
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_init
+  ensure_db_dir
+  sql_exec(SCHEMA)
+  $stderr.puts "book: initialized #{DB_PATH}"
+end
+
+def cmd_doctor
+  report = {}
+
+  # Ruby
+  report['ruby'] = { 'version' => RUBY_VERSION, 'ok' => true }
+
+  # sqlite3 binary
+  sqlite_out, sqlite_status = Open3.capture2(SQLITE3, '--version')
+  report['sqlite3'] = {
+    'path' => SQLITE3,
+    'version' => sqlite_status.success? ? sqlite_out.strip.split.first : nil,
+    'ok' => sqlite_status.success?
+  }
+
+  # claude CLI
+  claude_out, claude_status = Open3.capture2('claude', '--version')
+  report['claude'] = {
+    'version' => claude_status.success? ? claude_out.strip : nil,
+    'ok' => claude_status.success?
+  }
+
+  # Database
+  report['database'] = {
+    'path' => DB_PATH,
+    'exists' => File.exist?(DB_PATH)
+  }
+
+  # Overall
+  report['ok'] = report.values.all? { |v| v.is_a?(Hash) ? v['ok'] != false : true }
+
+  puts JSON.pretty_generate(report)
+  exit(report['ok'] ? 0 : 1)
+rescue Errno::ENOENT
+  report['claude'] = { 'ok' => false, 'error' => 'not found' }
+  report['ok'] = false
+  puts JSON.pretty_generate(report)
+  exit 1
+end
+
+def cmd_add(args)
+  description = args.shift
+  if description.nil? || description.strip.empty?
+    $stderr.puts 'book: description required'
+    exit 1
+  end
+  priority = parse_flag(args, '--priority') || '0'
+
+  ensure_db
+
+  result = sql_exec(<<~SQL)
+    INSERT INTO tasks(description, priority) VALUES ('#{escape_sql(description)}', #{priority.to_i});
+    SELECT last_insert_rowid();
+  SQL
+
+  if result.nil? || result.empty?
+    $stderr.puts 'book: failed to add task'
+    exit 1
+  end
+
+  puts result
+  $stderr.puts "book: added task ##{result}"
+end
+
+def cmd_list
+  require_db
+
+  rows = sql_query_json(<<~SQL)
+    SELECT id, description, priority, status, created_at
+    FROM tasks
+    ORDER BY priority DESC, id ASC;
+  SQL
+
+  if rows.empty?
+    $stderr.puts 'book: no tasks'
+    return
+  end
+
+  puts "ID\tPRI\tSTATUS\tDESCRIPTION"
+  rows.each do |r|
+    puts "#{r['id']}\t#{r['priority']}\t#{r['status']}\t#{r['description']}"
+  end
+end
+
+def cmd_next
+  require_db
+
+  rows = sql_query_json(<<~SQL)
+    SELECT id, description, priority, status, retries, max_retries
+    FROM tasks
+    WHERE status IN ('pending', 'error')
+      AND (status = 'pending' OR retries < max_retries)
+    ORDER BY priority DESC, id ASC
+    LIMIT 1;
+  SQL
+
+  if rows.empty?
+    $stderr.puts 'book: no pending tasks'
+    return
+  end
+
+  puts JSON.generate(rows.first)
+end
+
+def cmd_status
+  require_db
+
+  rows = sql_query_json(<<~SQL)
+    SELECT status, COUNT(*) as count
+    FROM tasks
+    GROUP BY status
+    ORDER BY status;
+  SQL
+
+  if rows.empty?
+    $stderr.puts 'book: no tasks'
+    return
+  end
+
+  rows.each do |r|
+    puts "#{r['status']}\t#{r['count']}"
+  end
+end
+
+def cmd_done(args)
+  id = args.shift
+  if id.nil?
+    $stderr.puts 'book: task ID required'
+    exit 1
+  end
+
+  require_db
+
+  sql_exec(<<~SQL)
+    UPDATE tasks
+    SET status = 'done', completed_at = datetime('now')
+    WHERE id = #{id.to_i};
+  SQL
+
+  $stderr.puts "book: task ##{id} done"
+end
+
+def cmd_fail(args)
+  id = args.shift
+  if id.nil?
+    $stderr.puts 'book: task ID required'
+    exit 1
+  end
+
+  reason = parse_flag(args, '--reason') || 'no reason given'
+
+  require_db
+
+  sql_exec(<<~SQL)
+    UPDATE tasks
+    SET status = 'failed', completed_at = datetime('now'), result = '#{escape_sql(reason)}'
+    WHERE id = #{id.to_i};
+  SQL
+
+  $stderr.puts "book: task ##{id} failed"
+end
+
+def cmd_error(args)
+  id = args.shift
+  if id.nil?
+    $stderr.puts 'book: task ID required'
+    exit 1
+  end
+
+  reason = parse_flag(args, '--reason') || 'no reason given'
+
+  require_db
+
+  # Increment retries; if retries >= max_retries, mark failed instead
+  task = sql_query_json("SELECT retries, max_retries FROM tasks WHERE id = #{id.to_i};")
+  if task.empty?
+    $stderr.puts "book: task ##{id} not found"
+    exit 1
+  end
+
+  retries = task.first['retries'].to_i + 1
+  max = task.first['max_retries'].to_i
+
+  if retries >= max
+    sql_exec(<<~SQL)
+      UPDATE tasks
+      SET status = 'failed', completed_at = datetime('now'),
+          result = '#{escape_sql(reason)} (max retries reached)', retries = #{retries}
+      WHERE id = #{id.to_i};
+    SQL
+    $stderr.puts "book: task ##{id} failed (max retries reached)"
+  else
+    sql_exec(<<~SQL)
+      UPDATE tasks
+      SET status = 'error', result = '#{escape_sql(reason)}', retries = #{retries}
+      WHERE id = #{id.to_i};
+    SQL
+    $stderr.puts "book: task ##{id} error (retry #{retries}/#{max})"
+  end
+end
+
+def cmd_block(args)
+  id = args.shift
+  if id.nil?
+    $stderr.puts 'book: task ID required'
+    exit 1
+  end
+
+  gate = parse_flag(args, '--gate')
+  action = parse_flag(args, '--action')
+
+  if gate.nil? || action.nil?
+    $stderr.puts 'book: --gate and --action required'
+    exit 1
+  end
+
+  require_db
+
+  sql_exec(<<~SQL)
+    UPDATE tasks SET status = 'blocked' WHERE id = #{id.to_i};
+  SQL
+
+  result = sql_exec(<<~SQL)
+    INSERT INTO reviews(task_id, gate_reason, action_desc)
+    VALUES (#{id.to_i}, '#{escape_sql(gate)}', '#{escape_sql(action)}');
+    SELECT last_insert_rowid();
+  SQL
+
+  $stderr.puts "book: task ##{id} blocked — review ##{result} created"
+end
+
+def cmd_drop(args)
+  id = args.shift
+  if id.nil?
+    $stderr.puts 'book: task ID required'
+    exit 1
+  end
+
+  require_db
+
+  sql_exec("DELETE FROM tasks WHERE id = #{id.to_i};")
+  $stderr.puts "book: task ##{id} dropped"
+end
+
+def cmd_reprioritize(args)
+  id = args.shift
+  if id.nil?
+    $stderr.puts 'book: task ID required'
+    exit 1
+  end
+
+  priority = parse_flag(args, '--priority')
+  if priority.nil?
+    $stderr.puts 'book: --priority required'
+    exit 1
+  end
+
+  require_db
+
+  sql_exec("UPDATE tasks SET priority = #{priority.to_i} WHERE id = #{id.to_i};")
+  $stderr.puts "book: task ##{id} reprioritized to #{priority}"
+end
+
+def cmd_reviews
+  require_db
+
+  rows = sql_query_json(<<~SQL)
+    SELECT r.id, r.task_id, r.gate_reason, r.action_desc, r.status, r.created_at
+    FROM reviews r
+    WHERE r.status = 'pending'
+    ORDER BY r.created_at ASC;
+  SQL
+
+  if rows.empty?
+    $stderr.puts 'book: no pending reviews'
+    return
+  end
+
+  puts "ID\tTASK\tGATE\tACTION\tSTATUS"
+  rows.each do |r|
+    puts "#{r['id']}\t#{r['task_id']}\t#{r['gate_reason']}\t#{r['action_desc']}\t#{r['status']}"
+  end
+end
+
+def cmd_approve(args)
+  id = args.shift
+  if id.nil?
+    $stderr.puts 'book: review ID required'
+    exit 1
+  end
+
+  name = parse_flag(args, '--as')
+  if name.nil?
+    $stderr.puts 'book: --as NAME required'
+    exit 1
+  end
+
+  notes = parse_flag(args, '--notes') || ''
+
+  require_db
+
+  # Get the review
+  review = sql_query_json("SELECT task_id, gate_reason, action_desc FROM reviews WHERE id = #{id.to_i} AND status = 'pending';")
+  if review.empty?
+    $stderr.puts "book: review ##{id} not found or already resolved"
+    exit 1
+  end
+
+  task_id = review.first['task_id']
+  gate_reason = review.first['gate_reason']
+  action_desc = review.first['action_desc']
+
+  # Resolve review
+  sql_exec(<<~SQL)
+    UPDATE reviews
+    SET status = 'approved', resolved_by = '#{escape_sql(name)}',
+        resolved_at = datetime('now'), notes = '#{escape_sql(notes)}'
+    WHERE id = #{id.to_i};
+  SQL
+
+  # Record approval
+  sql_exec(<<~SQL)
+    INSERT INTO approvals(task_id, gate_reason, description, approved_by, notes)
+    VALUES (#{task_id}, '#{escape_sql(gate_reason)}', '#{escape_sql(action_desc)}',
+            '#{escape_sql(name)}', '#{escape_sql(notes)}');
+  SQL
+
+  # Unblock task
+  sql_exec("UPDATE tasks SET status = 'pending' WHERE id = #{task_id};")
+
+  $stderr.puts "book: review ##{id} approved — task ##{task_id} unblocked"
+end
+
+def cmd_reject(args)
+  id = args.shift
+  if id.nil?
+    $stderr.puts 'book: review ID required'
+    exit 1
+  end
+
+  name = parse_flag(args, '--as')
+  if name.nil?
+    $stderr.puts 'book: --as NAME required'
+    exit 1
+  end
+
+  notes = parse_flag(args, '--notes') || ''
+
+  require_db
+
+  # Get the review
+  review = sql_query_json("SELECT task_id FROM reviews WHERE id = #{id.to_i} AND status = 'pending';")
+  if review.empty?
+    $stderr.puts "book: review ##{id} not found or already resolved"
+    exit 1
+  end
+
+  task_id = review.first['task_id']
+
+  # Resolve review
+  sql_exec(<<~SQL)
+    UPDATE reviews
+    SET status = 'rejected', resolved_by = '#{escape_sql(name)}',
+        resolved_at = datetime('now'), notes = '#{escape_sql(notes)}'
+    WHERE id = #{id.to_i};
+  SQL
+
+  # Fail the task
+  sql_exec(<<~SQL)
+    UPDATE tasks
+    SET status = 'failed', completed_at = datetime('now'),
+        result = 'rejected by #{escape_sql(name)}: #{escape_sql(notes)}'
+    WHERE id = #{task_id};
+  SQL
+
+  $stderr.puts "book: review ##{id} rejected — task ##{task_id} failed"
+end
+
+def cmd_dispatch
+  ensure_db
+
+  # Find next task
+  rows = sql_query_json(<<~SQL)
+    SELECT id, description, priority, status, retries, max_retries
+    FROM tasks
+    WHERE status IN ('pending', 'error')
+      AND (status = 'pending' OR retries < max_retries)
+    ORDER BY priority DESC, id ASC
+    LIMIT 1;
+  SQL
+
+  if rows.empty?
+    $stderr.puts 'book: no tasks to dispatch'
+    return
+  end
+
+  task = rows.first
+  task_id = task['id']
+
+  # Mark running
+  sql_exec(<<~SQL)
+    UPDATE tasks SET status = 'running', started_at = datetime('now')
+    WHERE id = #{task_id};
+  SQL
+
+  $stderr.puts "book: dispatching task ##{task_id}: #{task['description']}"
+
+  # Check for prior approvals
+  approvals = sql_query_json(<<~SQL)
+    SELECT gate_reason, description, approved_by, approved_at
+    FROM approvals
+    WHERE task_id = #{task_id}
+    ORDER BY approved_at DESC;
+  SQL
+
+  approval_context = ''
+  unless approvals.empty?
+    lines = approvals.map { |a| "- #{a['gate_reason']}: #{a['description']} (approved by #{a['approved_by']} at #{a['approved_at']})" }
+    approval_context = "\n\nPrior approvals for this task:\n#{lines.join("\n")}"
+  end
+
+  prompt = <<~PROMPT
+    You are executing a task from a work queue. Complete the task and report your result.
+
+    Task ##{task_id}: #{task['description']}#{approval_context}
+
+    When you are done, end your response with exactly one of these status lines:
+    STATUS: DONE — <brief summary of what was accomplished>
+    STATUS: BLOCKED — GATE: <reason> — ACTION: <what needs approval>
+    STATUS: ERROR — <what went wrong, will be retried>
+    STATUS: FAILED — <what went wrong, unrecoverable>
+
+    The status line must be the last line of your response.
+  PROMPT
+
+  result = call_claude(prompt)
+
+  if result.nil?
+    # claude failed to run — mark error for retry
+    sql_exec(<<~SQL)
+      UPDATE tasks
+      SET status = 'error', result = 'claude -p failed to execute',
+          retries = retries + 1
+      WHERE id = #{task_id};
+    SQL
+    $stderr.puts "book: task ##{task_id} errored (claude unavailable)"
+    return
+  end
+
+  puts result
+
+  # Parse the last line for status
+  last_line = result.lines.last&.strip || ''
+
+  case last_line
+  when /\ASTATUS:\s*DONE\b/i
+    sql_exec(<<~SQL)
+      UPDATE tasks
+      SET status = 'done', completed_at = datetime('now'), result = '#{escape_sql(result)}'
+      WHERE id = #{task_id};
+    SQL
+    $stderr.puts "book: task ##{task_id} done"
+
+  when /\ASTATUS:\s*BLOCKED\b.*GATE:\s*(.+?)\s*—\s*ACTION:\s*(.+)/i
+    gate_reason = $1.strip
+    action_desc = $2.strip
+
+    sql_exec("UPDATE tasks SET status = 'blocked' WHERE id = #{task_id};")
+
+    review_id = sql_exec(<<~SQL)
+      INSERT INTO reviews(task_id, gate_reason, action_desc, context)
+      VALUES (#{task_id}, '#{escape_sql(gate_reason)}', '#{escape_sql(action_desc)}',
+              '#{escape_sql(result)}');
+      SELECT last_insert_rowid();
+    SQL
+
+    $stderr.puts "book: task ##{task_id} blocked — review ##{review_id} created"
+
+  when /\ASTATUS:\s*ERROR\b/i
+    retries = task['retries'].to_i + 1
+    max = task['max_retries'].to_i
+
+    if retries >= max
+      sql_exec(<<~SQL)
+        UPDATE tasks
+        SET status = 'failed', completed_at = datetime('now'),
+            result = '#{escape_sql(result)} (max retries reached)', retries = #{retries}
+        WHERE id = #{task_id};
+      SQL
+      $stderr.puts "book: task ##{task_id} failed (max retries reached)"
+    else
+      sql_exec(<<~SQL)
+        UPDATE tasks
+        SET status = 'error', result = '#{escape_sql(result)}', retries = #{retries}
+        WHERE id = #{task_id};
+      SQL
+      $stderr.puts "book: task ##{task_id} error (retry #{retries}/#{max})"
+    end
+
+  when /\ASTATUS:\s*FAILED\b/i
+    sql_exec(<<~SQL)
+      UPDATE tasks
+      SET status = 'failed', completed_at = datetime('now'), result = '#{escape_sql(result)}'
+      WHERE id = #{task_id};
+    SQL
+    $stderr.puts "book: task ##{task_id} failed"
+
+  else
+    # No recognized status line — treat as done
+    sql_exec(<<~SQL)
+      UPDATE tasks
+      SET status = 'done', completed_at = datetime('now'), result = '#{escape_sql(result)}'
+      WHERE id = #{task_id};
+    SQL
+    $stderr.puts "book: task ##{task_id} done (no status line — assumed complete)"
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+def usage
+  $stderr.puts <<~USAGE
+    Usage: book <command> [args]
+
+    Commands:
+      init                                  Create database
+      add "description" --priority N        Add a task (prints ID)
+      list                                  All tasks by priority desc
+      next                                  Highest-priority pending/error task
+      done ID                               Mark task completed
+      fail ID --reason "..."                Mark task unrecoverably failed
+      error ID --reason "..."               Mark task as retriable failure
+      block ID --gate "..." --action "..."  Policy block — creates a review
+      drop ID                               Delete a task
+      reprioritize ID --priority N          Change priority
+      status                                Counts by state
+
+      reviews                               List pending reviews
+      approve ID --as NAME [--notes "..."]  Approve a review, unblock task
+      reject ID --as NAME [--notes "..."]   Reject a review, fail task
+
+      dispatch                              Execute next task via claude -p
+      doctor                                Check prerequisites (JSON)
+  USAGE
+  exit 1
+end
+
+command = ARGV.shift
+case command
+when 'init'          then cmd_init
+when 'doctor'        then cmd_doctor
+when 'add'           then cmd_add(ARGV.dup)
+when 'list'          then cmd_list
+when 'next'          then cmd_next
+when 'status'        then cmd_status
+when 'done'          then cmd_done(ARGV.dup)
+when 'fail'          then cmd_fail(ARGV.dup)
+when 'error'         then cmd_error(ARGV.dup)
+when 'block'         then cmd_block(ARGV.dup)
+when 'drop'          then cmd_drop(ARGV.dup)
+when 'reprioritize'  then cmd_reprioritize(ARGV.dup)
+when 'reviews'       then cmd_reviews
+when 'approve'       then cmd_approve(ARGV.dup)
+when 'reject'        then cmd_reject(ARGV.dup)
+when 'dispatch'      then cmd_dispatch
+else usage
+end

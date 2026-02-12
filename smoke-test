@@ -1,0 +1,525 @@
+#!/usr/bin/env bash
+
+# smoke-test — end-to-end verification of every book happy path
+#
+# Runs against a temporary database so production data is never touched.
+# Each test exercises one happy path and reports pass/fail.
+#
+# Usage:
+#   ./smoke-test            Run all tests (dispatch tests require claude CLI)
+#   ./smoke-test --quick    Skip tests that require claude CLI
+#
+# Dependencies: bash, ruby, sqlite3
+#
+# Behavior:
+#   1. Creates a temporary directory for the test database
+#   2. Runs each test in sequence
+#   3. Prints pass/fail for each
+#   4. Cleans up the temporary directory
+#   5. Exits 0 if all pass, 1 if any fail
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BOOK="$SCRIPT_DIR/bin/book"
+QUICK=false
+[[ "${1:-}" == "--quick" ]] && QUICK=true
+
+# Temporary database for tests
+TMPDIR_BASE=$(mktemp -d)
+export BOOK_DB="$TMPDIR_BASE/test.db"
+
+cleanup() {
+  rm -rf "$TMPDIR_BASE"
+}
+trap cleanup EXIT
+
+passed=0
+failed=0
+failures=()
+
+pass() {
+  printf "  \033[32m✓\033[0m %s\n" "$1"
+  ((passed++))
+}
+
+fail() {
+  printf "  \033[31m✗\033[0m %s — %s\n" "$1" "$2"
+  ((failed++))
+  failures+=("$1")
+}
+
+section() {
+  printf "\n\033[1m%s\033[0m\n" "$1"
+}
+
+# ---------------------------------------------------------------------------
+section "Doctor"
+# ---------------------------------------------------------------------------
+
+test_doctor_json() {
+  local output
+  output=$("$BOOK" doctor 2>/dev/null)
+  if echo "$output" | ruby -rjson -e 'JSON.parse(STDIN.read)' 2>/dev/null; then
+    pass "Doctor output is valid JSON"
+  else
+    fail "Doctor JSON" "output is not valid JSON"
+  fi
+}
+test_doctor_json
+
+test_doctor_exit() {
+  "$BOOK" doctor >/dev/null 2>&1
+  local exit_code=$?
+  if [[ $exit_code -eq 0 ]]; then
+    pass "Doctor exits 0"
+  else
+    fail "Doctor exit" "expected exit 0, got $exit_code"
+  fi
+}
+test_doctor_exit
+
+# ---------------------------------------------------------------------------
+section "Init"
+# ---------------------------------------------------------------------------
+
+test_init() {
+  local output
+  output=$("$BOOK" init 2>&1)
+  if echo "$output" | grep -q "initialized"; then
+    pass "Init creates database"
+  else
+    fail "Init" "expected 'initialized' in output, got: $output"
+  fi
+}
+test_init
+
+test_db_exists() {
+  if [[ -f "$BOOK_DB" ]]; then
+    pass "Database file exists after init"
+  else
+    fail "Database file" "not created at $BOOK_DB"
+  fi
+}
+test_db_exists
+
+test_db_tables() {
+  local tables
+  tables=$(sqlite3 "$BOOK_DB" ".tables" 2>/dev/null)
+  local missing=()
+  for table in tasks reviews approvals; do
+    echo "$tables" | grep -q "$table" || missing+=("$table")
+  done
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    pass "Database has all expected tables (tasks, reviews, approvals)"
+  else
+    fail "Database tables" "missing: ${missing[*]}"
+  fi
+}
+test_db_tables
+
+# ---------------------------------------------------------------------------
+section "Add"
+# ---------------------------------------------------------------------------
+
+# Fresh DB
+rm -f "$BOOK_DB"
+"$BOOK" init 2>/dev/null
+
+test_add_returns_id() {
+  local output
+  output=$("$BOOK" add "test task one" 2>/dev/null)
+  if [[ "$output" =~ ^[0-9]+$ ]]; then
+    pass "Add returns numeric ID"
+  else
+    fail "Add returns ID" "expected numeric ID, got: $output"
+  fi
+}
+test_add_returns_id
+
+test_add_priority() {
+  local id
+  id=$("$BOOK" add "high priority task" --priority 10 2>/dev/null)
+  local row
+  row=$(sqlite3 -json "$BOOK_DB" "SELECT priority FROM tasks WHERE id = $id;" 2>/dev/null)
+  local priority
+  priority=$(echo "$row" | ruby -rjson -e 'puts JSON.parse(STDIN.read).first["priority"]' 2>/dev/null)
+  if [[ "$priority" == "10" ]]; then
+    pass "Add --priority sets priority"
+  else
+    fail "Add priority" "expected 10, got: $priority"
+  fi
+}
+test_add_priority
+
+# ---------------------------------------------------------------------------
+section "List"
+# ---------------------------------------------------------------------------
+
+test_list_ordered() {
+  # DB already has tasks from Add section: "test task one" (pri 0) and "high priority task" (pri 10)
+  local output
+  output=$("$BOOK" list 2>/dev/null)
+  # First data row (after header) should be the high-priority task
+  local first_task
+  first_task=$(echo "$output" | sed -n '2p')
+  if echo "$first_task" | grep -q "high priority task"; then
+    pass "List orders by priority desc"
+  else
+    fail "List order" "expected 'high priority task' first, got: $first_task"
+  fi
+}
+test_list_ordered
+
+# ---------------------------------------------------------------------------
+section "Next"
+# ---------------------------------------------------------------------------
+
+test_next_pending() {
+  local output
+  output=$("$BOOK" next 2>/dev/null)
+  if echo "$output" | ruby -rjson -e 'data = JSON.parse(STDIN.read); exit(data["description"] == "high priority task" ? 0 : 1)' 2>/dev/null; then
+    pass "Next returns highest-priority pending task"
+  else
+    fail "Next pending" "expected 'high priority task', got: $output"
+  fi
+}
+test_next_pending
+
+test_next_error_eligible() {
+  # Mark the high-priority task as error (retriable)
+  local hp_id
+  hp_id=$(sqlite3 "$BOOK_DB" "SELECT id FROM tasks WHERE description = 'high priority task';" 2>/dev/null)
+  "$BOOK" error "$hp_id" --reason "temporary failure" 2>/dev/null
+
+  local output
+  output=$("$BOOK" next 2>/dev/null)
+  if echo "$output" | ruby -rjson -e 'data = JSON.parse(STDIN.read); exit(data["description"] == "high priority task" ? 0 : 1)' 2>/dev/null; then
+    pass "Next returns error tasks eligible for retry"
+  else
+    fail "Next error" "expected error task to be eligible, got: $output"
+  fi
+
+  # Reset for later tests
+  sqlite3 "$BOOK_DB" "UPDATE tasks SET status = 'pending', retries = 0 WHERE id = $hp_id;" 2>/dev/null
+}
+test_next_error_eligible
+
+# ---------------------------------------------------------------------------
+section "Status"
+# ---------------------------------------------------------------------------
+
+test_status_counts() {
+  local output
+  output=$("$BOOK" status 2>/dev/null)
+  if echo "$output" | grep -q "pending"; then
+    pass "Status shows counts by state"
+  else
+    fail "Status counts" "expected 'pending' in output, got: $output"
+  fi
+}
+test_status_counts
+
+# ---------------------------------------------------------------------------
+section "Done / Fail / Error / Block"
+# ---------------------------------------------------------------------------
+
+test_done() {
+  local id
+  id=$("$BOOK" add "task to complete" 2>/dev/null)
+  "$BOOK" done "$id" 2>/dev/null
+  local status
+  status=$(sqlite3 "$BOOK_DB" "SELECT status FROM tasks WHERE id = $id;" 2>/dev/null)
+  if [[ "$status" == "done" ]]; then
+    pass "Done marks task completed"
+  else
+    fail "Done" "expected 'done', got: $status"
+  fi
+}
+test_done
+
+test_fail() {
+  local id
+  id=$("$BOOK" add "task to fail" 2>/dev/null)
+  "$BOOK" fail "$id" --reason "host unreachable" 2>/dev/null
+  local status
+  status=$(sqlite3 "$BOOK_DB" "SELECT status FROM tasks WHERE id = $id;" 2>/dev/null)
+  if [[ "$status" == "failed" ]]; then
+    pass "Fail marks task unrecoverably failed"
+  else
+    fail "Fail" "expected 'failed', got: $status"
+  fi
+}
+test_fail
+
+test_error() {
+  local id
+  id=$("$BOOK" add "task to error" 2>/dev/null)
+  "$BOOK" error "$id" --reason "timeout" 2>/dev/null
+  local status
+  status=$(sqlite3 "$BOOK_DB" "SELECT status FROM tasks WHERE id = $id;" 2>/dev/null)
+  if [[ "$status" == "error" ]]; then
+    pass "Error marks task as retriable failure"
+  else
+    fail "Error" "expected 'error', got: $status"
+  fi
+}
+test_error
+
+test_block() {
+  local id
+  id=$("$BOOK" add "task to block" 2>/dev/null)
+  "$BOOK" block "$id" --gate "requires-approval" --action "deploy to prod" 2>/dev/null
+  local status
+  status=$(sqlite3 "$BOOK_DB" "SELECT status FROM tasks WHERE id = $id;" 2>/dev/null)
+  if [[ "$status" == "blocked" ]]; then
+    pass "Block marks task blocked"
+  else
+    fail "Block" "expected 'blocked', got: $status"
+  fi
+}
+test_block
+
+# ---------------------------------------------------------------------------
+section "Block creates review"
+# ---------------------------------------------------------------------------
+
+test_block_creates_review() {
+  local id
+  id=$("$BOOK" add "another block task" 2>/dev/null)
+  "$BOOK" block "$id" --gate "policy-violation" --action "write to /etc" 2>/dev/null
+  local review_count
+  review_count=$(sqlite3 "$BOOK_DB" "SELECT COUNT(*) FROM reviews WHERE task_id = $id;" 2>/dev/null)
+  if [[ "$review_count" -ge 1 ]]; then
+    pass "Block creates a review row"
+  else
+    fail "Block review" "expected review row for task $id, got count: $review_count"
+  fi
+}
+test_block_creates_review
+
+test_block_review_fields() {
+  # Use the review from the previous test
+  local review
+  review=$(sqlite3 -json "$BOOK_DB" "SELECT gate_reason, action_desc, status FROM reviews ORDER BY id DESC LIMIT 1;" 2>/dev/null)
+  local gate action rstatus
+  gate=$(echo "$review" | ruby -rjson -e 'puts JSON.parse(STDIN.read).first["gate_reason"]' 2>/dev/null)
+  action=$(echo "$review" | ruby -rjson -e 'puts JSON.parse(STDIN.read).first["action_desc"]' 2>/dev/null)
+  rstatus=$(echo "$review" | ruby -rjson -e 'puts JSON.parse(STDIN.read).first["status"]' 2>/dev/null)
+  if [[ "$gate" == "policy-violation" && "$action" == "write to /etc" && "$rstatus" == "pending" ]]; then
+    pass "Review has correct gate_reason, action_desc, and pending status"
+  else
+    fail "Review fields" "gate=$gate action=$action status=$rstatus"
+  fi
+}
+test_block_review_fields
+
+# ---------------------------------------------------------------------------
+section "Error retry"
+# ---------------------------------------------------------------------------
+
+test_error_retry() {
+  local id
+  id=$("$BOOK" add "retry task" --priority 0 2>/dev/null)
+
+  # Error three times — max_retries defaults to 3
+  "$BOOK" error "$id" --reason "attempt 1" 2>/dev/null
+  local r1
+  r1=$(sqlite3 "$BOOK_DB" "SELECT retries FROM tasks WHERE id = $id;" 2>/dev/null)
+
+  "$BOOK" error "$id" --reason "attempt 2" 2>/dev/null
+  local r2
+  r2=$(sqlite3 "$BOOK_DB" "SELECT retries FROM tasks WHERE id = $id;" 2>/dev/null)
+
+  "$BOOK" error "$id" --reason "attempt 3" 2>/dev/null
+  local final_status
+  final_status=$(sqlite3 "$BOOK_DB" "SELECT status FROM tasks WHERE id = $id;" 2>/dev/null)
+
+  if [[ "$r1" == "1" && "$r2" == "2" && "$final_status" == "failed" ]]; then
+    pass "Error increments retries and fails after max_retries"
+  else
+    fail "Error retry" "r1=$r1 r2=$r2 final=$final_status (expected 1, 2, failed)"
+  fi
+}
+test_error_retry
+
+# ---------------------------------------------------------------------------
+section "Reprioritize"
+# ---------------------------------------------------------------------------
+
+test_reprioritize() {
+  local id
+  id=$("$BOOK" add "repri task" --priority 1 2>/dev/null)
+  "$BOOK" reprioritize "$id" --priority 99 2>/dev/null
+  local priority
+  priority=$(sqlite3 "$BOOK_DB" "SELECT priority FROM tasks WHERE id = $id;" 2>/dev/null)
+  if [[ "$priority" == "99" ]]; then
+    pass "Reprioritize changes priority"
+  else
+    fail "Reprioritize" "expected 99, got: $priority"
+  fi
+}
+test_reprioritize
+
+# ---------------------------------------------------------------------------
+section "Approve"
+# ---------------------------------------------------------------------------
+
+test_approve() {
+  local task_id
+  task_id=$("$BOOK" add "approval task" 2>/dev/null)
+  "$BOOK" block "$task_id" --gate "needs-review" --action "merge PR" 2>/dev/null
+
+  # Get review ID
+  local review_id
+  review_id=$(sqlite3 "$BOOK_DB" "SELECT id FROM reviews WHERE task_id = $task_id AND status = 'pending' LIMIT 1;" 2>/dev/null)
+
+  "$BOOK" approve "$review_id" --as "kerry" --notes "looks good" 2>/dev/null
+
+  local task_status
+  task_status=$(sqlite3 "$BOOK_DB" "SELECT status FROM tasks WHERE id = $task_id;" 2>/dev/null)
+  local review_status
+  review_status=$(sqlite3 "$BOOK_DB" "SELECT status FROM reviews WHERE id = $review_id;" 2>/dev/null)
+
+  if [[ "$task_status" == "pending" && "$review_status" == "approved" ]]; then
+    pass "Approve unblocks task and resolves review"
+  else
+    fail "Approve" "task=$task_status review=$review_status (expected pending, approved)"
+  fi
+}
+test_approve
+
+test_approve_records_name() {
+  local resolved_by
+  resolved_by=$(sqlite3 "$BOOK_DB" "SELECT resolved_by FROM reviews WHERE status = 'approved' ORDER BY id DESC LIMIT 1;" 2>/dev/null)
+  if [[ "$resolved_by" == "kerry" ]]; then
+    pass "Approve records approver name"
+  else
+    fail "Approve name" "expected 'kerry', got: $resolved_by"
+  fi
+}
+test_approve_records_name
+
+test_approve_creates_approval_row() {
+  local count
+  count=$(sqlite3 "$BOOK_DB" "SELECT COUNT(*) FROM approvals WHERE approved_by = 'kerry';" 2>/dev/null)
+  if [[ "$count" -ge 1 ]]; then
+    pass "Approve creates an approval record"
+  else
+    fail "Approval record" "expected approval row, got count: $count"
+  fi
+}
+test_approve_creates_approval_row
+
+# ---------------------------------------------------------------------------
+section "Reject"
+# ---------------------------------------------------------------------------
+
+test_reject() {
+  local task_id
+  task_id=$("$BOOK" add "rejection task" 2>/dev/null)
+  "$BOOK" block "$task_id" --gate "unsafe" --action "rm -rf /" 2>/dev/null
+
+  local review_id
+  review_id=$(sqlite3 "$BOOK_DB" "SELECT id FROM reviews WHERE task_id = $task_id AND status = 'pending' LIMIT 1;" 2>/dev/null)
+
+  "$BOOK" reject "$review_id" --as "kerry" --notes "too dangerous" 2>/dev/null
+
+  local task_status
+  task_status=$(sqlite3 "$BOOK_DB" "SELECT status FROM tasks WHERE id = $task_id;" 2>/dev/null)
+  local review_status
+  review_status=$(sqlite3 "$BOOK_DB" "SELECT status FROM reviews WHERE id = $review_id;" 2>/dev/null)
+
+  if [[ "$task_status" == "failed" && "$review_status" == "rejected" ]]; then
+    pass "Reject fails task and resolves review"
+  else
+    fail "Reject" "task=$task_status review=$review_status (expected failed, rejected)"
+  fi
+}
+test_reject
+
+# ---------------------------------------------------------------------------
+section "Drop"
+# ---------------------------------------------------------------------------
+
+test_drop() {
+  local id
+  id=$("$BOOK" add "task to drop" 2>/dev/null)
+  "$BOOK" drop "$id" 2>/dev/null
+  local count
+  count=$(sqlite3 "$BOOK_DB" "SELECT COUNT(*) FROM tasks WHERE id = $id;" 2>/dev/null)
+  if [[ "$count" == "0" ]]; then
+    pass "Drop removes task"
+  else
+    fail "Drop" "expected 0 rows, got: $count"
+  fi
+}
+test_drop
+
+# ---------------------------------------------------------------------------
+section "Dispatch"
+# ---------------------------------------------------------------------------
+
+if $QUICK; then
+  printf "  \033[33m⊘\033[0m Dispatch tests skipped (--quick mode)\n"
+else
+  test_dispatch() {
+    # Fresh DB for dispatch
+    rm -f "$BOOK_DB"
+    "$BOOK" init 2>/dev/null
+    "$BOOK" add "say hello world" --priority 5 2>/dev/null
+
+    local output
+    output=$("$BOOK" dispatch 2>/dev/null)
+    if [[ -n "$output" ]]; then
+      pass "Dispatch executes a task and produces output"
+    else
+      fail "Dispatch" "no output from dispatch"
+    fi
+  }
+  test_dispatch
+
+  test_dispatch_marks_done() {
+    local status
+    status=$(sqlite3 "$BOOK_DB" "SELECT status FROM tasks WHERE id = 1;" 2>/dev/null)
+    if [[ "$status" == "done" || "$status" == "error" || "$status" == "failed" ]]; then
+      pass "Dispatch updates task status after execution"
+    else
+      fail "Dispatch status" "expected terminal/error status, got: $status"
+    fi
+  }
+  test_dispatch_marks_done
+
+  test_dispatch_empty_queue() {
+    # Clear all tasks
+    sqlite3 "$BOOK_DB" "DELETE FROM tasks;" 2>/dev/null
+    local stderr_output
+    stderr_output=$("$BOOK" dispatch 2>&1 >/dev/null)
+    if echo "$stderr_output" | grep -q "no tasks"; then
+      pass "Dispatch with empty queue reports no tasks"
+    else
+      fail "Dispatch empty" "expected 'no tasks', got: $stderr_output"
+    fi
+  }
+  test_dispatch_empty_queue
+fi
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+
+printf "\n\033[1m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n"
+printf "\033[1m%d passed\033[0m" "$passed"
+[[ $failed -gt 0 ]] && printf ", \033[31m%d failed\033[0m" "$failed"
+printf "\n"
+
+if [[ $failed -gt 0 ]]; then
+  printf "\n\033[31mFailing:\033[0m\n"
+  for f in "${failures[@]}"; do
+    printf "  • %s\n" "$f"
+  done
+  printf "\n"
+  exit 1
+fi
+
+exit 0
