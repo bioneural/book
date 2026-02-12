@@ -75,6 +75,12 @@ require 'json'
 require 'open3'
 require 'fileutils'
 
+SPILL_HOME = ENV['SPILL_HOME'] || File.expand_path('../../spill', __dir__)
+if File.directory?(SPILL_HOME)
+  require File.join(SPILL_HOME, 'lib', 'spill')
+  Spill.configure(tool: 'book')
+end
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -139,7 +145,7 @@ end
 def sql_exec(query)
   stdout, stderr, status = Open3.capture3(SQLITE3, DB_PATH, stdin_data: query)
   unless status.success?
-    $stderr.puts "book: sqlite3 error: #{stderr.strip}"
+    defined?(Spill) ? Spill.error("sqlite3 error: #{stderr.strip}") : $stderr.puts("book: sqlite3 error: #{stderr.strip}")
     return nil
   end
   stdout.strip
@@ -148,13 +154,13 @@ end
 def sql_query_json(query)
   stdout, stderr, status = Open3.capture3(SQLITE3, '-json', DB_PATH, stdin_data: query)
   unless status.success?
-    $stderr.puts "book: sqlite3 error: #{stderr.strip}"
+    defined?(Spill) ? Spill.error("sqlite3 error: #{stderr.strip}") : $stderr.puts("book: sqlite3 error: #{stderr.strip}")
     return []
   end
   return [] if stdout.strip.empty?
   JSON.parse(stdout)
 rescue JSON::ParserError => e
-  $stderr.puts "book: JSON parse error: #{e.message}"
+  defined?(Spill) ? Spill.error("JSON parse error: #{e.message}") : $stderr.puts("book: JSON parse error: #{e.message}")
   []
 end
 
@@ -169,7 +175,7 @@ end
 
 def require_db
   unless db_exists?
-    $stderr.puts "book: database not found at #{DB_PATH} — run `book init`"
+    defined?(Spill) ? Spill.error("database not found at #{DB_PATH} — run `book init`") : $stderr.puts("book: database not found at #{DB_PATH} — run `book init`")
     exit 1
   end
 end
@@ -190,17 +196,17 @@ end
 def call_claude(prompt)
   stdout, status = Open3.capture2('claude', '-p', stdin_data: prompt)
   unless status.success?
-    $stderr.puts "book: claude -p exited with #{status.exitstatus}"
+    defined?(Spill) ? Spill.error("claude -p exited with #{status.exitstatus}") : $stderr.puts("book: claude -p exited with #{status.exitstatus}")
     return nil
   end
   result = stdout.strip
   result = result.sub(/\A```\w*\n?/, '').sub(/\n?```\z/, '').strip
   result
 rescue Errno::ENOENT
-  $stderr.puts 'book: claude CLI not found'
+  defined?(Spill) ? Spill.warn("claude CLI not found") : $stderr.puts("book: claude CLI not found")
   nil
 rescue => e
-  $stderr.puts "book: claude -p failed: #{e.message}"
+  defined?(Spill) ? Spill.error("claude -p failed: #{e.message}") : $stderr.puts("book: claude -p failed: #{e.message}")
   nil
 end
 
@@ -211,7 +217,7 @@ end
 def cmd_init
   ensure_db_dir
   sql_exec(SCHEMA)
-  $stderr.puts "book: initialized #{DB_PATH}"
+  defined?(Spill) ? Spill.info("initialized #{DB_PATH}") : $stderr.puts("book: initialized #{DB_PATH}")
 end
 
 def cmd_doctor
@@ -256,7 +262,7 @@ end
 def cmd_add(args)
   description = args.shift
   if description.nil? || description.strip.empty?
-    $stderr.puts 'book: description required'
+    defined?(Spill) ? Spill.error("description required") : $stderr.puts("book: description required")
     exit 1
   end
   priority = parse_flag(args, '--priority') || '0'
@@ -269,12 +275,12 @@ def cmd_add(args)
   SQL
 
   if result.nil? || result.empty?
-    $stderr.puts 'book: failed to add task'
+    defined?(Spill) ? Spill.error("failed to add task") : $stderr.puts("book: failed to add task")
     exit 1
   end
 
   puts result
-  $stderr.puts "book: added task ##{result}"
+  defined?(Spill) ? Spill.info("added task ##{result}") : $stderr.puts("book: added task ##{result}")
 end
 
 def cmd_list
@@ -287,7 +293,7 @@ def cmd_list
   SQL
 
   if rows.empty?
-    $stderr.puts 'book: no tasks'
+    defined?(Spill) ? Spill.info("no tasks") : $stderr.puts("book: no tasks")
     return
   end
 
@@ -310,7 +316,7 @@ def cmd_next
   SQL
 
   if rows.empty?
-    $stderr.puts 'book: no pending tasks'
+    defined?(Spill) ? Spill.info("no pending tasks") : $stderr.puts("book: no pending tasks")
     return
   end
 
@@ -328,7 +334,7 @@ def cmd_status
   SQL
 
   if rows.empty?
-    $stderr.puts 'book: no tasks'
+    defined?(Spill) ? Spill.info("no tasks") : $stderr.puts("book: no tasks")
     return
   end
 
@@ -340,7 +346,7 @@ end
 def cmd_done(args)
   id = args.shift
   if id.nil?
-    $stderr.puts 'book: task ID required'
+    defined?(Spill) ? Spill.error("task ID required") : $stderr.puts("book: task ID required")
     exit 1
   end
 
@@ -352,13 +358,13 @@ def cmd_done(args)
     WHERE id = #{id.to_i};
   SQL
 
-  $stderr.puts "book: task ##{id} done"
+  defined?(Spill) ? Spill.info("task ##{id} done") : $stderr.puts("book: task ##{id} done")
 end
 
 def cmd_fail(args)
   id = args.shift
   if id.nil?
-    $stderr.puts 'book: task ID required'
+    defined?(Spill) ? Spill.error("task ID required") : $stderr.puts("book: task ID required")
     exit 1
   end
 
@@ -372,13 +378,13 @@ def cmd_fail(args)
     WHERE id = #{id.to_i};
   SQL
 
-  $stderr.puts "book: task ##{id} failed"
+  defined?(Spill) ? Spill.info("task ##{id} failed") : $stderr.puts("book: task ##{id} failed")
 end
 
 def cmd_error(args)
   id = args.shift
   if id.nil?
-    $stderr.puts 'book: task ID required'
+    defined?(Spill) ? Spill.error("task ID required") : $stderr.puts("book: task ID required")
     exit 1
   end
 
@@ -389,7 +395,7 @@ def cmd_error(args)
   # Increment retries; if retries >= max_retries, mark failed instead
   task = sql_query_json("SELECT retries, max_retries FROM tasks WHERE id = #{id.to_i};")
   if task.empty?
-    $stderr.puts "book: task ##{id} not found"
+    defined?(Spill) ? Spill.error("task ##{id} not found") : $stderr.puts("book: task ##{id} not found")
     exit 1
   end
 
@@ -403,21 +409,21 @@ def cmd_error(args)
           result = '#{escape_sql(reason)} (max retries reached)', retries = #{retries}
       WHERE id = #{id.to_i};
     SQL
-    $stderr.puts "book: task ##{id} failed (max retries reached)"
+    defined?(Spill) ? Spill.info("task ##{id} failed (max retries reached)") : $stderr.puts("book: task ##{id} failed (max retries reached)")
   else
     sql_exec(<<~SQL)
       UPDATE tasks
       SET status = 'error', result = '#{escape_sql(reason)}', retries = #{retries}
       WHERE id = #{id.to_i};
     SQL
-    $stderr.puts "book: task ##{id} error (retry #{retries}/#{max})"
+    defined?(Spill) ? Spill.info("task ##{id} error (retry #{retries}/#{max})") : $stderr.puts("book: task ##{id} error (retry #{retries}/#{max})")
   end
 end
 
 def cmd_block(args)
   id = args.shift
   if id.nil?
-    $stderr.puts 'book: task ID required'
+    defined?(Spill) ? Spill.error("task ID required") : $stderr.puts("book: task ID required")
     exit 1
   end
 
@@ -425,7 +431,7 @@ def cmd_block(args)
   action = parse_flag(args, '--action')
 
   if gate.nil? || action.nil?
-    $stderr.puts 'book: --gate and --action required'
+    defined?(Spill) ? Spill.error("--gate and --action required") : $stderr.puts("book: --gate and --action required")
     exit 1
   end
 
@@ -441,39 +447,39 @@ def cmd_block(args)
     SELECT last_insert_rowid();
   SQL
 
-  $stderr.puts "book: task ##{id} blocked — review ##{result} created"
+  defined?(Spill) ? Spill.info("task ##{id} blocked — review ##{result} created") : $stderr.puts("book: task ##{id} blocked — review ##{result} created")
 end
 
 def cmd_drop(args)
   id = args.shift
   if id.nil?
-    $stderr.puts 'book: task ID required'
+    defined?(Spill) ? Spill.error("task ID required") : $stderr.puts("book: task ID required")
     exit 1
   end
 
   require_db
 
   sql_exec("DELETE FROM tasks WHERE id = #{id.to_i};")
-  $stderr.puts "book: task ##{id} dropped"
+  defined?(Spill) ? Spill.info("task ##{id} dropped") : $stderr.puts("book: task ##{id} dropped")
 end
 
 def cmd_reprioritize(args)
   id = args.shift
   if id.nil?
-    $stderr.puts 'book: task ID required'
+    defined?(Spill) ? Spill.error("task ID required") : $stderr.puts("book: task ID required")
     exit 1
   end
 
   priority = parse_flag(args, '--priority')
   if priority.nil?
-    $stderr.puts 'book: --priority required'
+    defined?(Spill) ? Spill.error("--priority required") : $stderr.puts("book: --priority required")
     exit 1
   end
 
   require_db
 
   sql_exec("UPDATE tasks SET priority = #{priority.to_i} WHERE id = #{id.to_i};")
-  $stderr.puts "book: task ##{id} reprioritized to #{priority}"
+  defined?(Spill) ? Spill.info("task ##{id} reprioritized to #{priority}") : $stderr.puts("book: task ##{id} reprioritized to #{priority}")
 end
 
 def cmd_reviews
@@ -487,7 +493,7 @@ def cmd_reviews
   SQL
 
   if rows.empty?
-    $stderr.puts 'book: no pending reviews'
+    defined?(Spill) ? Spill.info("no pending reviews") : $stderr.puts("book: no pending reviews")
     return
   end
 
@@ -500,13 +506,13 @@ end
 def cmd_approve(args)
   id = args.shift
   if id.nil?
-    $stderr.puts 'book: review ID required'
+    defined?(Spill) ? Spill.error("review ID required") : $stderr.puts("book: review ID required")
     exit 1
   end
 
   name = parse_flag(args, '--as')
   if name.nil?
-    $stderr.puts 'book: --as NAME required'
+    defined?(Spill) ? Spill.error("--as NAME required") : $stderr.puts("book: --as NAME required")
     exit 1
   end
 
@@ -517,7 +523,7 @@ def cmd_approve(args)
   # Get the review
   review = sql_query_json("SELECT task_id, gate_reason, action_desc FROM reviews WHERE id = #{id.to_i} AND status = 'pending';")
   if review.empty?
-    $stderr.puts "book: review ##{id} not found or already resolved"
+    defined?(Spill) ? Spill.error("review ##{id} not found or already resolved") : $stderr.puts("book: review ##{id} not found or already resolved")
     exit 1
   end
 
@@ -543,19 +549,19 @@ def cmd_approve(args)
   # Unblock task
   sql_exec("UPDATE tasks SET status = 'pending' WHERE id = #{task_id};")
 
-  $stderr.puts "book: review ##{id} approved — task ##{task_id} unblocked"
+  defined?(Spill) ? Spill.info("review ##{id} approved — task ##{task_id} unblocked") : $stderr.puts("book: review ##{id} approved — task ##{task_id} unblocked")
 end
 
 def cmd_reject(args)
   id = args.shift
   if id.nil?
-    $stderr.puts 'book: review ID required'
+    defined?(Spill) ? Spill.error("review ID required") : $stderr.puts("book: review ID required")
     exit 1
   end
 
   name = parse_flag(args, '--as')
   if name.nil?
-    $stderr.puts 'book: --as NAME required'
+    defined?(Spill) ? Spill.error("--as NAME required") : $stderr.puts("book: --as NAME required")
     exit 1
   end
 
@@ -566,7 +572,7 @@ def cmd_reject(args)
   # Get the review
   review = sql_query_json("SELECT task_id FROM reviews WHERE id = #{id.to_i} AND status = 'pending';")
   if review.empty?
-    $stderr.puts "book: review ##{id} not found or already resolved"
+    defined?(Spill) ? Spill.error("review ##{id} not found or already resolved") : $stderr.puts("book: review ##{id} not found or already resolved")
     exit 1
   end
 
@@ -588,7 +594,7 @@ def cmd_reject(args)
     WHERE id = #{task_id};
   SQL
 
-  $stderr.puts "book: review ##{id} rejected — task ##{task_id} failed"
+  defined?(Spill) ? Spill.info("review ##{id} rejected — task ##{task_id} failed") : $stderr.puts("book: review ##{id} rejected — task ##{task_id} failed")
 end
 
 def cmd_dispatch
@@ -605,7 +611,7 @@ def cmd_dispatch
   SQL
 
   if rows.empty?
-    $stderr.puts 'book: no tasks to dispatch'
+    defined?(Spill) ? Spill.info("no tasks to dispatch") : $stderr.puts("book: no tasks to dispatch")
     return
   end
 
@@ -618,7 +624,7 @@ def cmd_dispatch
     WHERE id = #{task_id};
   SQL
 
-  $stderr.puts "book: dispatching task ##{task_id}: #{task['description']}"
+  defined?(Spill) ? Spill.info("dispatching task ##{task_id}: #{task['description']}") : $stderr.puts("book: dispatching task ##{task_id}: #{task['description']}")
 
   # Check for prior approvals
   approvals = sql_query_json(<<~SQL)
@@ -658,7 +664,7 @@ def cmd_dispatch
           retries = retries + 1
       WHERE id = #{task_id};
     SQL
-    $stderr.puts "book: task ##{task_id} errored (claude unavailable)"
+    defined?(Spill) ? Spill.info("task ##{task_id} errored (claude unavailable)") : $stderr.puts("book: task ##{task_id} errored (claude unavailable)")
     return
   end
 
@@ -674,7 +680,7 @@ def cmd_dispatch
       SET status = 'done', completed_at = datetime('now'), result = '#{escape_sql(result)}'
       WHERE id = #{task_id};
     SQL
-    $stderr.puts "book: task ##{task_id} done"
+    defined?(Spill) ? Spill.info("task ##{task_id} done") : $stderr.puts("book: task ##{task_id} done")
 
   when /\ASTATUS:\s*BLOCKED\b.*GATE:\s*(.+?)\s*—\s*ACTION:\s*(.+)/i
     gate_reason = $1.strip
@@ -689,7 +695,7 @@ def cmd_dispatch
       SELECT last_insert_rowid();
     SQL
 
-    $stderr.puts "book: task ##{task_id} blocked — review ##{review_id} created"
+    defined?(Spill) ? Spill.info("task ##{task_id} blocked — review ##{review_id} created") : $stderr.puts("book: task ##{task_id} blocked — review ##{review_id} created")
 
   when /\ASTATUS:\s*ERROR\b/i
     retries = task['retries'].to_i + 1
@@ -702,14 +708,14 @@ def cmd_dispatch
             result = '#{escape_sql(result)} (max retries reached)', retries = #{retries}
         WHERE id = #{task_id};
       SQL
-      $stderr.puts "book: task ##{task_id} failed (max retries reached)"
+      defined?(Spill) ? Spill.info("task ##{task_id} failed (max retries reached)") : $stderr.puts("book: task ##{task_id} failed (max retries reached)")
     else
       sql_exec(<<~SQL)
         UPDATE tasks
         SET status = 'error', result = '#{escape_sql(result)}', retries = #{retries}
         WHERE id = #{task_id};
       SQL
-      $stderr.puts "book: task ##{task_id} error (retry #{retries}/#{max})"
+      defined?(Spill) ? Spill.info("task ##{task_id} error (retry #{retries}/#{max})") : $stderr.puts("book: task ##{task_id} error (retry #{retries}/#{max})")
     end
 
   when /\ASTATUS:\s*FAILED\b/i
@@ -718,7 +724,7 @@ def cmd_dispatch
       SET status = 'failed', completed_at = datetime('now'), result = '#{escape_sql(result)}'
       WHERE id = #{task_id};
     SQL
-    $stderr.puts "book: task ##{task_id} failed"
+    defined?(Spill) ? Spill.info("task ##{task_id} failed") : $stderr.puts("book: task ##{task_id} failed")
 
   else
     # No recognized status line — treat as done
@@ -727,7 +733,7 @@ def cmd_dispatch
       SET status = 'done', completed_at = datetime('now'), result = '#{escape_sql(result)}'
       WHERE id = #{task_id};
     SQL
-    $stderr.puts "book: task ##{task_id} done (no status line — assumed complete)"
+    defined?(Spill) ? Spill.info("task ##{task_id} done (no status line — assumed complete)") : $stderr.puts("book: task ##{task_id} done (no status line — assumed complete)")
   end
 end
 
