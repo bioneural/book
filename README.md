@@ -6,7 +6,7 @@
 
 A prioritized work queue that survives across sessions. Tasks enter, a dispatcher executes them via `claude -p`, and gate blocks produce reviews requiring human approval before work resumes. Intention persists even when an agent does not.
 
-Ruby, stdlib only. One SQLite database. No dependencies beyond a sqlite3 CLI.
+Ruby stdlib plus the sqlite3 gem. No other gems.
 
 ---
 
@@ -184,8 +184,7 @@ State lives at `.state/book/book.db` by default. Override with the `BOOK_DB` env
 
 ## Prerequisites
 
-- Ruby (stdlib only — no gems)
-- sqlite3 CLI
+- Ruby stdlib plus the sqlite3 gem
 - claude CLI (for dispatch)
 
 ## Prophet integration
