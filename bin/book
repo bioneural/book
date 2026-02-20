@@ -58,7 +58,7 @@
 #   dispatch  — task result on stdout
 #   others    — confirmation on stderr
 #
-# Dependencies: ruby (stdlib only), sqlite3 (CLI)
+# Dependencies: ruby (stdlib plus sqlite3 gem)
 #
 # Behavior:
 #   dispatch:
@@ -194,7 +194,7 @@ def parse_flag(args, flag)
 end
 
 def call_claude(prompt)
-  stdout, status = Open3.capture2('claude', '-p', stdin_data: prompt)
+  stdout, status = Open3.capture2({ 'CLAUDECODE' => nil }, 'claude', '-p', stdin_data: prompt)
   unless status.success?
     defined?(Spill) ? Spill.error("claude -p exited with #{status.exitstatus}") : $stderr.puts("book: claude -p exited with #{status.exitstatus}")
     return nil
