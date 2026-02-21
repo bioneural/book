@@ -194,9 +194,10 @@ def parse_flag(args, flag)
 end
 
 def call_claude(prompt)
-  stdout, status = Open3.capture2({ 'CLAUDECODE' => nil }, 'claude', '-p', stdin_data: prompt)
+  stdout, stderr, status = Open3.capture3({ 'CLAUDECODE' => nil }, 'claude', '-p', stdin_data: prompt)
   unless status.success?
-    defined?(Spill) ? Spill.error("claude -p exited with #{status.exitstatus}") : $stderr.puts("book: claude -p exited with #{status.exitstatus}")
+    err_preview = stderr.to_s.strip[0, 200]
+    defined?(Spill) ? Spill.error("claude -p exited with #{status.exitstatus}: #{err_preview}") : $stderr.puts("book: claude -p exited with #{status.exitstatus}: #{err_preview}")
     return nil
   end
   result = stdout.strip
