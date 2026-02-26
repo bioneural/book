@@ -249,7 +249,32 @@ def cmd_doctor
     'exists' => File.exist?(DB_PATH)
   }
 
+  # Probe
+  if ARGV.include?('--probe')
+    begin
+      require 'tmpdir'
+      probe_db = File.join(Dir.tmpdir, "book-probe-#{$$}.db")
+      probe_env = { 'BOOK_DB' => probe_db }
+      Open3.capture2e(probe_env, 'ruby', __FILE__, 'init')
+      Open3.capture2e(probe_env, 'ruby', __FILE__, 'add', 'probe task', '--priority', '1')
+      output, status = Open3.capture2(probe_env, 'ruby', __FILE__, 'next', err: File::NULL)
+      if status.success? && !output.strip.empty?
+        parsed = JSON.parse(output)
+        has_keys = parsed.key?('id') && parsed.key?('description')
+        report['probe'] = { 'ok' => true }
+        report['probe']['warn'] = 'next output missing id or description keys' unless has_keys
+      else
+        report['probe'] = { 'ok' => true, 'warn' => 'next returned empty' }
+      end
+    rescue => e
+      report['probe'] = { 'ok' => true, 'warn' => "probe error: #{e.message}" }
+    ensure
+      FileUtils.rm_f(probe_db) if probe_db
+    end
+  end
+
   # Overall
+  report['protocol_version'] = 1
   report['ok'] = report.values.all? { |v| v.is_a?(Hash) ? v['ok'] != false : true }
 
   puts JSON.pretty_generate(report)
