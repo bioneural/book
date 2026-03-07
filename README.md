@@ -125,11 +125,45 @@ Prior approvals for a task are included in a dispatch prompt, so the model knows
 
 ## Human approval
 
-When a task is blocked — whether by dispatcher output or by a manual `book block` command — a review row is created. `book reviews` lists pending reviews. A human resolves each with `book approve` or `book reject`.
+When a task is blocked — whether by dispatcher output or by a manual `book block` command — a review row is created. `book reviews` lists pending reviews. A human resolves a review with one of five feedback actions:
+
+| Action | Command | Effect |
+|--------|---------|--------|
+| **Authorize** | `book approve` | Unblock task, record approval |
+| **Deny** | `book reject` | Fail task with rejection reason |
+| **Redirect** | `book redirect` | Fail original task, create a replacement task |
+| **Correct** | `book correct` | Unblock task, write a correction to crib |
+| **Clarify** | `book clarify` | Unblock task, prepend clarification to task description |
+
+```bash
+book approve 1 --as kerry --notes "approved for deploy window"
+book reject 1 --as kerry --notes "not ready"
+book redirect 1 --as kerry --notes "wrong approach" --task "use blue-green deploy instead"
+book correct 1 --as kerry --notes "use port 8080, not 3000"
+book clarify 1 --as kerry --notes "scope is staging only, not production"
+```
+
+Correct and clarify actions write feedback to crib as operator-feedback entries, so the correction or clarification persists as memory for future sessions.
 
 An approval records a reviewer's name and creates a row in the `approvals` table. Approvals persist and are surfaced to subsequent dispatch runs for the same task, so a model can act on previously granted permissions.
 
 A rejection marks the task as `failed` with the reviewer's reason.
+
+## Pause and resume
+
+Dispatch can be paused to prevent task execution when human review is needed:
+
+```bash
+book pause     # creates .state/book/paused flag
+book resume    # removes the flag
+book paused    # returns JSON: {"paused": true/false}
+```
+
+When paused, `book dispatch` returns immediately without executing a task. Prophet's heartbeat auto-pauses dispatch when pending reviews exist and auto-resumes when all reviews are resolved.
+
+## Claude semaphore
+
+A file lock at `.state/book/claude.lock` prevents concurrent dispatch. If a dispatch is already running, subsequent calls skip with a log message instead of racing on `claude -p`.
 
 ## Schema
 
