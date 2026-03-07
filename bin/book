@@ -87,6 +87,9 @@ end
 # ---------------------------------------------------------------------------
 
 DB_PATH = ENV.fetch('BOOK_DB') { File.join(Dir.pwd, '.state', 'book', 'book.db') }
+STATE_DIR = ENV.fetch('BOOK_STATE_DIR') { File.join(Dir.pwd, '.state', 'book') }
+CLAUDE_LOCK = File.join(STATE_DIR, 'claude.lock')
+PAUSED_FLAG = File.join(STATE_DIR, 'paused')
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -137,6 +140,7 @@ SQL
 def open_db
   db = SQLite3::Database.new(DB_PATH)
   db.busy_timeout = 5000
+  db.execute('PRAGMA journal_mode=WAL')
   db.results_as_hash = true
   db
 end
@@ -216,10 +220,30 @@ end
 # Commands
 # ---------------------------------------------------------------------------
 
+MIGRATIONS = <<~SQL
+  -- Add feedback_type column if missing
+  CREATE TABLE IF NOT EXISTS _migration_check (id INTEGER);
+  DROP TABLE IF EXISTS _migration_check;
+SQL
+
+def migrate_db(db)
+  # Check and add feedback_type column
+  columns = db.execute("PRAGMA table_info(reviews)").map { |c| c['name'] }
+  unless columns.include?('feedback_type')
+    db.execute("ALTER TABLE reviews ADD COLUMN feedback_type TEXT DEFAULT 'approve'")
+  end
+  unless columns.include?('redirect_task_id')
+    db.execute("ALTER TABLE reviews ADD COLUMN redirect_task_id INTEGER")
+  end
+rescue SQLite3::Exception => e
+  defined?(Spill) ? Spill.warn("migration warning: #{e.message}") : $stderr.puts("book: migration warning: #{e.message}")
+end
+
 def cmd_init
   ensure_db_dir
   db = open_db
   db.execute_batch(SCHEMA)
+  migrate_db(db)
   db.close
   defined?(Spill) ? Spill.info("initialized #{DB_PATH}") : $stderr.puts("book: initialized #{DB_PATH}")
 end
@@ -634,7 +658,209 @@ def cmd_reject(args)
   defined?(Spill) ? Spill.info("review ##{id} rejected — task ##{task_id} failed") : $stderr.puts("book: review ##{id} rejected — task ##{task_id} failed")
 end
 
+def paused?
+  File.exist?(PAUSED_FLAG)
+end
+
+def cmd_pause
+  FileUtils.mkdir_p(STATE_DIR)
+  FileUtils.touch(PAUSED_FLAG)
+  defined?(Spill) ? Spill.info("dispatch paused") : $stderr.puts("book: dispatch paused")
+end
+
+def cmd_resume
+  FileUtils.rm_f(PAUSED_FLAG)
+  defined?(Spill) ? Spill.info("dispatch resumed") : $stderr.puts("book: dispatch resumed")
+end
+
+def cmd_paused
+  puts JSON.generate({ paused: paused? })
+end
+
+def cmd_redirect(args)
+  id = args.shift
+  if id.nil?
+    defined?(Spill) ? Spill.error("review ID required") : $stderr.puts("book: review ID required")
+    exit 1
+  end
+
+  name = parse_flag(args, '--as')
+  if name.nil?
+    defined?(Spill) ? Spill.error("--as NAME required") : $stderr.puts("book: --as NAME required")
+    exit 1
+  end
+
+  notes = parse_flag(args, '--notes') || ''
+  replacement = parse_flag(args, '--task')
+  if replacement.nil? || replacement.strip.empty?
+    defined?(Spill) ? Spill.error("--task required") : $stderr.puts("book: --task required")
+    exit 1
+  end
+
+  require_db
+
+  db = open_db
+
+  review = sql_query(db, "SELECT task_id FROM reviews WHERE id = ? AND status = 'pending'", [id.to_i])
+  if review.empty?
+    db.close
+    defined?(Spill) ? Spill.error("review ##{id} not found or already resolved") : $stderr.puts("book: review ##{id} not found or already resolved")
+    exit 1
+  end
+
+  task_id = review.first['task_id']
+
+  # Resolve review as redirected
+  sql_exec(db, <<~SQL, [name, notes, id.to_i])
+    UPDATE reviews
+    SET status = 'rejected', resolved_by = ?,
+        resolved_at = datetime('now'), notes = ?
+    WHERE id = ?;
+  SQL
+
+  # Fail the original task
+  sql_exec(db, <<~SQL, ["redirected by #{name}: #{notes}", task_id])
+    UPDATE tasks
+    SET status = 'failed', completed_at = datetime('now'),
+        result = ?
+    WHERE id = ?;
+  SQL
+
+  # Create replacement task
+  new_id = sql_insert_returning_id(db, "INSERT INTO tasks(description, priority) VALUES (?, 0)", [replacement])
+  db.close
+
+  puts new_id.to_s
+  defined?(Spill) ? Spill.info("review ##{id} redirected — task ##{task_id} failed, new task ##{new_id} created") : $stderr.puts("book: review ##{id} redirected — task ##{task_id} failed, new task ##{new_id} created")
+end
+
+def cmd_correct(args)
+  id = args.shift
+  if id.nil?
+    defined?(Spill) ? Spill.error("review ID required") : $stderr.puts("book: review ID required")
+    exit 1
+  end
+
+  name = parse_flag(args, '--as')
+  if name.nil?
+    defined?(Spill) ? Spill.error("--as NAME required") : $stderr.puts("book: --as NAME required")
+    exit 1
+  end
+
+  notes = parse_flag(args, '--notes') || ''
+
+  require_db
+
+  db = open_db
+
+  review = sql_query(db, "SELECT task_id FROM reviews WHERE id = ? AND status = 'pending'", [id.to_i])
+  if review.empty?
+    db.close
+    defined?(Spill) ? Spill.error("review ##{id} not found or already resolved") : $stderr.puts("book: review ##{id} not found or already resolved")
+    exit 1
+  end
+
+  task_id = review.first['task_id']
+
+  # Resolve review
+  sql_exec(db, <<~SQL, [name, notes, id.to_i])
+    UPDATE reviews
+    SET status = 'approved', resolved_by = ?,
+        resolved_at = datetime('now'), notes = ?
+    WHERE id = ?;
+  SQL
+
+  # Unblock task
+  sql_exec(db, "UPDATE tasks SET status = 'pending' WHERE id = ?", [task_id])
+  db.close
+
+  # Write correction to crib
+  crib_bin = ENV['CRIB_BIN'] || File.join(File.expand_path('../../crib', __dir__), 'bin', 'crib')
+  if File.executable?(crib_bin)
+    Open3.capture2e(crib_bin, 'write', stdin_data: "type=correction [operator-feedback] #{notes}")
+  end
+
+  defined?(Spill) ? Spill.info("review ##{id} corrected — task ##{task_id} unblocked, correction written") : $stderr.puts("book: review ##{id} corrected — task ##{task_id} unblocked, correction written")
+end
+
+def cmd_clarify(args)
+  id = args.shift
+  if id.nil?
+    defined?(Spill) ? Spill.error("review ID required") : $stderr.puts("book: review ID required")
+    exit 1
+  end
+
+  name = parse_flag(args, '--as')
+  if name.nil?
+    defined?(Spill) ? Spill.error("--as NAME required") : $stderr.puts("book: --as NAME required")
+    exit 1
+  end
+
+  notes = parse_flag(args, '--notes') || ''
+
+  require_db
+
+  db = open_db
+
+  review = sql_query(db, "SELECT task_id FROM reviews WHERE id = ? AND status = 'pending'", [id.to_i])
+  if review.empty?
+    db.close
+    defined?(Spill) ? Spill.error("review ##{id} not found or already resolved") : $stderr.puts("book: review ##{id} not found or already resolved")
+    exit 1
+  end
+
+  task_id = review.first['task_id']
+
+  # Resolve review
+  sql_exec(db, <<~SQL, [name, notes, id.to_i])
+    UPDATE reviews
+    SET status = 'approved', resolved_by = ?,
+        resolved_at = datetime('now'), notes = ?
+    WHERE id = ?;
+  SQL
+
+  # Prepend clarification as context to task description
+  task = sql_query(db, "SELECT description FROM tasks WHERE id = ?", [task_id])
+  unless task.empty?
+    new_desc = "[Clarification from #{name}: #{notes}] #{task.first['description']}"
+    sql_exec(db, "UPDATE tasks SET status = 'pending', description = ? WHERE id = ?", [new_desc, task_id])
+  end
+  db.close
+
+  # Write clarification to crib
+  crib_bin = ENV['CRIB_BIN'] || File.join(File.expand_path('../../crib', __dir__), 'bin', 'crib')
+  if File.executable?(crib_bin)
+    Open3.capture2e(crib_bin, 'write', stdin_data: "type=note [operator-feedback] #{notes}")
+  end
+
+  defined?(Spill) ? Spill.info("review ##{id} clarified — task ##{task_id} unblocked, clarification prepended") : $stderr.puts("book: review ##{id} clarified — task ##{task_id} unblocked, clarification prepended")
+end
+
 def cmd_dispatch
+  # Check global pause flag
+  if paused?
+    defined?(Spill) ? Spill.info("dispatch skipped — paused") : $stderr.puts("book: dispatch skipped — paused")
+    return
+  end
+
+  # Acquire claude semaphore (non-blocking)
+  FileUtils.mkdir_p(STATE_DIR)
+  lock_file = File.open(CLAUDE_LOCK, File::RDWR | File::CREAT)
+  unless lock_file.flock(File::LOCK_EX | File::LOCK_NB)
+    lock_file.close
+    defined?(Spill) ? Spill.info("dispatch skipped — another dispatch is running") : $stderr.puts("book: dispatch skipped — another dispatch is running")
+    return
+  end
+
+  begin
+    dispatch_inner
+  ensure
+    lock_file.flock(File::LOCK_UN)
+    lock_file.close
+  end
+end
+
+def dispatch_inner
   ensure_db
 
   db = open_db
@@ -784,7 +1010,15 @@ def usage
       approve ID --as NAME [--notes "..."]  Approve a review, unblock task
       reject ID --as NAME [--notes "..."]   Reject a review, fail task
 
+      redirect ID --as NAME --notes "..." --task "replacement"
+                                            Fail task, create replacement
+      correct ID --as NAME --notes "..."    Unblock task, write correction to crib
+      clarify ID --as NAME --notes "..."    Unblock task, prepend clarification
+
       dispatch                              Execute next task via claude -p
+      pause                                 Pause dispatch
+      resume                                Resume dispatch
+      paused                                Check pause status (JSON)
       doctor                                Check prerequisites (JSON)
   USAGE
   exit 1
@@ -807,6 +1041,12 @@ when 'reprioritize'  then cmd_reprioritize(ARGV.dup)
 when 'reviews'       then cmd_reviews
 when 'approve'       then cmd_approve(ARGV.dup)
 when 'reject'        then cmd_reject(ARGV.dup)
+when 'redirect'      then cmd_redirect(ARGV.dup)
+when 'correct'       then cmd_correct(ARGV.dup)
+when 'clarify'       then cmd_clarify(ARGV.dup)
 when 'dispatch'      then cmd_dispatch
+when 'pause'         then cmd_pause
+when 'resume'        then cmd_resume
+when 'paused'        then cmd_paused
 else usage
 end

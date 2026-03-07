@@ -1,0 +1,321 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# test/smoke-test — verify book task queue lifecycle
+#
+# Usage:
+#   test/smoke-test           # fast: mocked claude for dispatch
+#   test/smoke-test --full    # includes real claude -p dispatch
+#
+# Dependencies: ruby, sqlite3 gem
+#
+# Behavior:
+#   1. Tests structure and syntax
+#   2. Tests init, add, list, next, done lifecycle
+#   3. Tests block/review/approve cycle
+#   4. Tests dispatch with mocked claude
+#   5. Tests doctor
+#   6. Reports pass/fail, exits 0/1
+
+require_relative '../../prophet/test/lib/test_harness'
+include TestHarness
+
+require 'open3'
+require 'json'
+require 'tmpdir'
+require 'fileutils'
+
+BOOK_ROOT = File.expand_path('..', __dir__)
+BOOK_BIN  = File.join(BOOK_ROOT, 'bin', 'book')
+
+tmpdir = Dir.mktmpdir('book-test')
+test_db = File.join(tmpdir, 'book.db')
+env = { 'BOOK_DB' => test_db }
+
+at_exit { FileUtils.rm_rf(tmpdir) }
+
+# -- Structure --
+
+section 'Structure'
+
+if File.executable?(BOOK_BIN)
+  pass 'bin/book exists and is executable'
+else
+  fail 'bin/book', 'not found or not executable'
+end
+
+section 'Syntax'
+
+_, status = Open3.capture2('ruby', '-c', BOOK_BIN, err: File::NULL)
+if status.success?
+  pass 'bin/book passes syntax check'
+else
+  fail 'bin/book syntax', 'syntax error'
+end
+
+# -- Init --
+
+section 'Init'
+
+init_out, init_status = Open3.capture2e(env, 'ruby', BOOK_BIN, 'init')
+if init_status.success?
+  pass 'book init exits 0'
+else
+  fail 'book init', "exited with #{init_status.exitstatus}"
+end
+
+if File.exist?(test_db)
+  pass 'Database file exists after init'
+else
+  fail 'Database file', 'not created'
+end
+
+# Verify WAL mode
+sqlite3_bin = ENV['SQLITE3'] || '/opt/homebrew/opt/sqlite/bin/sqlite3'
+wal_out, = Open3.capture2(sqlite3_bin, test_db, 'PRAGMA journal_mode;')
+if wal_out.strip == 'wal'
+  pass 'Database uses WAL journal mode'
+else
+  fail 'WAL mode', "expected wal, got #{wal_out.strip}"
+end
+
+# -- Task lifecycle --
+
+section 'Task lifecycle'
+
+# Add
+add_out, = Open3.capture2(env, 'ruby', BOOK_BIN, 'add', 'lifecycle smoke test', err: File::NULL)
+task_id = add_out.strip
+if task_id.match?(/\A\d+\z/)
+  pass "book add returns numeric ID (#{task_id})"
+else
+  fail 'book add', "expected numeric ID, got: #{task_id}"
+end
+
+# List
+list_out, = Open3.capture2(env, 'ruby', BOOK_BIN, 'list', err: File::NULL)
+if list_out.include?('lifecycle smoke test')
+  pass 'book list shows added task'
+else
+  fail 'book list', 'task not found in list'
+end
+
+# Next
+next_out, = Open3.capture2(env, 'ruby', BOOK_BIN, 'next', err: File::NULL)
+if next_out.include?('lifecycle smoke test')
+  pass 'book next returns pending task'
+else
+  fail 'book next', 'expected task in output'
+end
+
+# Done
+Open3.capture2(env, 'ruby', BOOK_BIN, 'done', task_id, err: File::NULL)
+next_after, = Open3.capture2(env, 'ruby', BOOK_BIN, 'next', err: File::NULL)
+if next_after.strip.empty? || !next_after.include?('lifecycle smoke test')
+  pass 'book done marks task complete (next returns empty)'
+else
+  fail 'book done', 'task still returned after done'
+end
+
+# Full lifecycle in one pass
+lifecycle_db = File.join(tmpdir, 'lifecycle.db')
+lenv = { 'BOOK_DB' => lifecycle_db }
+Open3.capture2(lenv, 'ruby', BOOK_BIN, 'init', err: File::NULL)
+
+id_out, = Open3.capture2(lenv, 'ruby', BOOK_BIN, 'add', 'full lifecycle test', err: File::NULL)
+tid = id_out.strip
+
+list2, = Open3.capture2(lenv, 'ruby', BOOK_BIN, 'list', err: File::NULL)
+next2, = Open3.capture2(lenv, 'ruby', BOOK_BIN, 'next', err: File::NULL)
+Open3.capture2(lenv, 'ruby', BOOK_BIN, 'done', tid, err: File::NULL)
+next3, = Open3.capture2(lenv, 'ruby', BOOK_BIN, 'next', err: File::NULL)
+
+if list2.include?('full lifecycle') && next2.include?('full lifecycle') &&
+   (next3.strip.empty? || !next3.include?('full lifecycle'))
+  pass 'Book task lifecycle (add -> list -> next -> done -> next-empty)'
+else
+  fail 'Book lifecycle', 'unexpected state transitions'
+end
+
+# -- Block and review --
+
+section 'Block and review'
+
+review_db = File.join(tmpdir, 'review.db')
+renv = { 'BOOK_DB' => review_db }
+Open3.capture2(renv, 'ruby', BOOK_BIN, 'init', err: File::NULL)
+
+rid_out, = Open3.capture2(renv, 'ruby', BOOK_BIN, 'add', 'review smoke test', err: File::NULL)
+rid = rid_out.strip
+
+Open3.capture2(renv, 'ruby', BOOK_BIN, 'block', rid,
+               '--gate', 'needs approval', '--action', 'deploy staging', err: File::NULL)
+
+reviews_out, = Open3.capture2(renv, 'ruby', BOOK_BIN, 'reviews', err: File::NULL)
+if reviews_out.include?('needs approval')
+  pass 'book block creates review'
+else
+  fail 'book block', 'review not found'
+end
+
+Open3.capture2(renv, 'ruby', BOOK_BIN, 'approve', '1', '--as', 'smoke-tester', err: File::NULL)
+next_review, = Open3.capture2(renv, 'ruby', BOOK_BIN, 'next', err: File::NULL)
+if next_review.include?('review smoke test')
+  pass 'Book block and review (add -> block -> reviews -> approve -> unblocked)'
+else
+  fail 'Book approve', 'task not unblocked after approval'
+end
+
+# -- Dispatch (mocked) --
+
+section 'Dispatch'
+
+# Dispatch uses claude -p — test only if PATH shims are set up
+if ENV['PATH']&.include?('test/shims')
+  dispatch_db = File.join(tmpdir, 'dispatch.db')
+  denv = { 'BOOK_DB' => dispatch_db }
+  Open3.capture2(denv, 'ruby', BOOK_BIN, 'init', err: File::NULL)
+  Open3.capture2(denv, 'ruby', BOOK_BIN, 'add', 'dispatch test task', err: File::NULL)
+
+  _, dispatch_status = Open3.capture2(denv, 'ruby', BOOK_BIN, 'dispatch', err: File::NULL)
+  if dispatch_status.success?
+    pass 'book dispatch exits 0 with mocked claude'
+  else
+    fail 'book dispatch', "exited with #{dispatch_status.exitstatus}"
+  end
+else
+  # Without shims, just test that dispatch exits 0 (it handles claude missing gracefully)
+  dispatch_out, dispatch_status = Open3.capture2(env, 'ruby', BOOK_BIN, 'dispatch', err: File::NULL)
+  if dispatch_status.success?
+    pass 'book dispatch exits 0'
+  else
+    fail 'book dispatch', "exited with #{dispatch_status.exitstatus}"
+  end
+end
+
+# -- Doctor --
+
+section 'Doctor'
+
+doctor_out, doctor_status = Open3.capture2(env, 'ruby', BOOK_BIN, 'doctor')
+if doctor_status.success?
+  begin
+    JSON.parse(doctor_out)
+    pass 'book doctor exits 0 with valid JSON'
+  rescue
+    fail 'book doctor', 'output is not valid JSON'
+  end
+else
+  fail 'book doctor', "exited with #{doctor_status.exitstatus}"
+end
+
+# -- Pause / Resume --
+
+section 'Pause and Resume'
+
+pause_db = File.join(tmpdir, 'pause.db')
+pause_state = File.join(tmpdir, 'pause-state')
+penv = { 'BOOK_DB' => pause_db, 'BOOK_STATE_DIR' => pause_state }
+
+Open3.capture2(penv, 'ruby', BOOK_BIN, 'init', err: File::NULL)
+Open3.capture2(penv, 'ruby', BOOK_BIN, 'add', 'pause test task', err: File::NULL)
+
+# Pause dispatch
+Open3.capture2(penv, 'ruby', BOOK_BIN, 'pause', err: File::NULL)
+
+paused_out, = Open3.capture2(penv, 'ruby', BOOK_BIN, 'paused', err: File::NULL)
+paused_json = JSON.parse(paused_out) rescue {}
+if paused_json['paused'] == true
+  pass 'book pause sets paused state'
+else
+  fail 'book pause', "expected paused=true, got #{paused_out.strip}"
+end
+
+# Dispatch should be skipped when paused
+_, dispatch_err = Open3.capture2e(penv, 'ruby', BOOK_BIN, 'dispatch')
+if dispatch_err.include?('paused')
+  pass 'book dispatch skips when paused'
+else
+  fail 'book dispatch paused', 'expected skip message'
+end
+
+# Resume
+Open3.capture2(penv, 'ruby', BOOK_BIN, 'resume', err: File::NULL)
+
+paused_out2, = Open3.capture2(penv, 'ruby', BOOK_BIN, 'paused', err: File::NULL)
+paused_json2 = JSON.parse(paused_out2) rescue {}
+if paused_json2['paused'] == false
+  pass 'book resume clears paused state'
+else
+  fail 'book resume', "expected paused=false, got #{paused_out2.strip}"
+end
+
+# -- Redirect / Correct / Clarify --
+
+section 'Feedback actions'
+
+fb_db = File.join(tmpdir, 'feedback.db')
+fbenv = { 'BOOK_DB' => fb_db }
+Open3.capture2(fbenv, 'ruby', BOOK_BIN, 'init', err: File::NULL)
+
+# Redirect test
+r_id_out, = Open3.capture2(fbenv, 'ruby', BOOK_BIN, 'add', 'redirect test', err: File::NULL)
+r_tid = r_id_out.strip
+Open3.capture2(fbenv, 'ruby', BOOK_BIN, 'block', r_tid,
+               '--gate', 'needs review', '--action', 'test action', err: File::NULL)
+
+new_id_out, redirect_status = Open3.capture2(fbenv, 'ruby', BOOK_BIN, 'redirect', '1',
+               '--as', 'tester', '--notes', 'wrong approach',
+               '--task', 'replacement task', err: File::NULL)
+if redirect_status.success? && new_id_out.strip.match?(/\A\d+\z/)
+  pass 'book redirect fails original, creates replacement task'
+else
+  fail 'book redirect', "unexpected output: #{new_id_out}"
+end
+
+# Correct test
+c_id_out, = Open3.capture2(fbenv, 'ruby', BOOK_BIN, 'add', 'correct test', err: File::NULL)
+c_tid = c_id_out.strip
+Open3.capture2(fbenv, 'ruby', BOOK_BIN, 'block', c_tid,
+               '--gate', 'needs correction', '--action', 'fix this', err: File::NULL)
+
+# Get the review ID for the correct test
+reviews_out, = Open3.capture2(fbenv, 'ruby', BOOK_BIN, 'reviews', err: File::NULL)
+review_id = reviews_out.lines.last&.split("\t")&.first&.strip || '2'
+
+_, correct_status = Open3.capture2(fbenv, 'ruby', BOOK_BIN, 'correct', review_id,
+               '--as', 'tester', '--notes', 'use different approach', err: File::NULL)
+if correct_status.success?
+  next_out, = Open3.capture2(fbenv, 'ruby', BOOK_BIN, 'next', err: File::NULL)
+  if next_out.include?('correct test')
+    pass 'book correct unblocks task'
+  else
+    fail 'book correct', 'task not unblocked'
+  end
+else
+  fail 'book correct', "exited with #{correct_status.exitstatus}"
+end
+
+# Clarify test
+cl_id_out, = Open3.capture2(fbenv, 'ruby', BOOK_BIN, 'add', 'clarify test', err: File::NULL)
+cl_tid = cl_id_out.strip
+Open3.capture2(fbenv, 'ruby', BOOK_BIN, 'block', cl_tid,
+               '--gate', 'needs clarity', '--action', 'explain this', err: File::NULL)
+
+reviews_out2, = Open3.capture2(fbenv, 'ruby', BOOK_BIN, 'reviews', err: File::NULL)
+cl_review_id = reviews_out2.lines.last&.split("\t")&.first&.strip || '3'
+
+_, clarify_status = Open3.capture2(fbenv, 'ruby', BOOK_BIN, 'clarify', cl_review_id,
+               '--as', 'tester', '--notes', 'scope is X not Y', err: File::NULL)
+if clarify_status.success?
+  next_cl, = Open3.capture2(fbenv, 'ruby', BOOK_BIN, 'next', err: File::NULL)
+  if next_cl.include?('Clarification from tester')
+    pass 'book clarify prepends clarification context'
+  else
+    fail 'book clarify', "expected clarification in description, got: #{next_cl}"
+  end
+else
+  fail 'book clarify', "exited with #{clarify_status.exitstatus}"
+end
+
+finish!
