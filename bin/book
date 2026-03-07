@@ -943,6 +943,13 @@ def dispatch_inner
     db.close
     defined?(Spill) ? Spill.info("task ##{task_id} done") : $stderr.puts("book: task ##{task_id} done")
 
+    # Spawn reflection as a detached background process (fail-open)
+    reflect_bin = File.expand_path('../../prophet/bin/reflect', __dir__)
+    if File.executable?(reflect_bin)
+      Process.spawn({ 'CLAUDECODE' => nil }, reflect_bin, '--task-id', task_id.to_s,
+        out: File::NULL, err: File::NULL, pgroup: true)
+    end
+
   when /\ASTATUS:\s*BLOCKED\b.*GATE:\s*(.+?)\s*—\s*ACTION:\s*(.+)/i
     gate_reason = $1.strip
     action_desc = $2.strip
