@@ -232,8 +232,8 @@ else
 end
 
 # Dispatch should be skipped when paused
-_, dispatch_err = Open3.capture2e(penv, 'ruby', BOOK_BIN, 'dispatch')
-if dispatch_err.include?('paused')
+dispatch_out, _dispatch_status = Open3.capture2e(penv, 'ruby', BOOK_BIN, 'dispatch')
+if dispatch_out.include?('paused')
   pass 'book dispatch skips when paused'
 else
   fail 'book dispatch paused', 'expected skip message'
