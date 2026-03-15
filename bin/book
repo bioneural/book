@@ -235,6 +235,27 @@ def migrate_db(db)
   unless columns.include?('redirect_task_id')
     db.execute("ALTER TABLE reviews ADD COLUMN redirect_task_id INTEGER")
   end
+
+  # Enriched task columns
+  task_columns = db.execute("PRAGMA table_info(tasks)").map { |c| c['name'] }
+  unless task_columns.include?('worker_id')
+    db.execute("ALTER TABLE tasks ADD COLUMN worker_id TEXT")
+  end
+  unless task_columns.include?('claimed_at')
+    db.execute("ALTER TABLE tasks ADD COLUMN claimed_at TEXT")
+  end
+  unless task_columns.include?('target_dir')
+    db.execute("ALTER TABLE tasks ADD COLUMN target_dir TEXT")
+  end
+  unless task_columns.include?('context')
+    db.execute("ALTER TABLE tasks ADD COLUMN context TEXT")
+  end
+  unless task_columns.include?('acceptance_criteria')
+    db.execute("ALTER TABLE tasks ADD COLUMN acceptance_criteria TEXT")
+  end
+  unless task_columns.include?('scope_boundaries')
+    db.execute("ALTER TABLE tasks ADD COLUMN scope_boundaries TEXT")
+  end
 rescue SQLite3::Exception => e
   defined?(Spill) ? Spill.warn("migration warning: #{e.message}") : $stderr.puts("book: migration warning: #{e.message}")
 end
@@ -317,11 +338,17 @@ def cmd_add(args)
     exit 1
   end
   priority = parse_flag(args, '--priority') || '0'
+  target_dir = parse_flag(args, '--target-dir')
+  context = parse_flag(args, '--context')
+  acceptance_criteria = parse_flag(args, '--acceptance-criteria')
+  scope_boundaries = parse_flag(args, '--scope-boundaries')
 
   ensure_db
 
   db = open_db
-  result = sql_insert_returning_id(db, "INSERT INTO tasks(description, priority) VALUES (?, ?)", [description, priority.to_i])
+  result = sql_insert_returning_id(db,
+    "INSERT INTO tasks(description, priority, target_dir, context, acceptance_criteria, scope_boundaries) VALUES (?, ?, ?, ?, ?, ?)",
+    [description, priority.to_i, target_dir, context, acceptance_criteria, scope_boundaries])
   db.close
 
   if result.nil?
@@ -331,6 +358,86 @@ def cmd_add(args)
 
   puts result
   defined?(Spill) ? Spill.info("added task ##{result}") : $stderr.puts("book: added task ##{result}")
+end
+
+def cmd_add_rich
+  input = $stdin.read.strip
+  if input.empty?
+    defined?(Spill) ? Spill.error("JSON input required on stdin") : $stderr.puts("book: JSON input required on stdin")
+    exit 1
+  end
+
+  begin
+    data = JSON.parse(input)
+  rescue JSON::ParserError => e
+    defined?(Spill) ? Spill.error("invalid JSON: #{e.message}") : $stderr.puts("book: invalid JSON: #{e.message}")
+    exit 1
+  end
+
+  description = data['description']
+  if description.nil? || description.strip.empty?
+    defined?(Spill) ? Spill.error("description required in JSON") : $stderr.puts("book: description required in JSON")
+    exit 1
+  end
+
+  ensure_db
+
+  db = open_db
+  result = sql_insert_returning_id(db,
+    "INSERT INTO tasks(description, priority, target_dir, context, acceptance_criteria, scope_boundaries) VALUES (?, ?, ?, ?, ?, ?)",
+    [description,
+     (data['priority'] || 0).to_i,
+     data['target_dir'],
+     data['context'].is_a?(Hash) ? JSON.generate(data['context']) : data['context'],
+     data['acceptance_criteria'],
+     data['scope_boundaries']])
+  db.close
+
+  if result.nil?
+    defined?(Spill) ? Spill.error("failed to add task") : $stderr.puts("book: failed to add task")
+    exit 1
+  end
+
+  puts result
+  defined?(Spill) ? Spill.info("added enriched task ##{result}") : $stderr.puts("book: added enriched task ##{result}")
+end
+
+def cmd_claim(args)
+  id = args.shift
+  if id.nil?
+    defined?(Spill) ? Spill.error("task ID required") : $stderr.puts("book: task ID required")
+    exit 1
+  end
+
+  worker_id = parse_flag(args, '--worker')
+  if worker_id.nil?
+    defined?(Spill) ? Spill.error("--worker required") : $stderr.puts("book: --worker required")
+    exit 1
+  end
+
+  require_db
+
+  db = open_db
+  sql_exec(db, "UPDATE tasks SET status = 'running', worker_id = ?, claimed_at = datetime('now'), started_at = datetime('now') WHERE id = ?", [worker_id, id.to_i])
+  db.close
+
+  defined?(Spill) ? Spill.info("task ##{id} claimed by #{worker_id}") : $stderr.puts("book: task ##{id} claimed by #{worker_id}")
+end
+
+def cmd_release(args)
+  id = args.shift
+  if id.nil?
+    defined?(Spill) ? Spill.error("task ID required") : $stderr.puts("book: task ID required")
+    exit 1
+  end
+
+  require_db
+
+  db = open_db
+  sql_exec(db, "UPDATE tasks SET status = 'pending', worker_id = NULL, claimed_at = NULL WHERE id = ?", [id.to_i])
+  db.close
+
+  defined?(Spill) ? Spill.info("task ##{id} released") : $stderr.puts("book: task ##{id} released")
 end
 
 def cmd_list
@@ -360,7 +467,7 @@ def cmd_next
 
   db = open_db
   rows = sql_query(db, <<~SQL)
-    SELECT id, description, priority, status, retries, max_retries
+    SELECT id, description, priority, status, retries, max_retries, target_dir, context, acceptance_criteria, scope_boundaries
     FROM tasks
     WHERE status IN ('pending', 'error')
       AND (status = 'pending' OR retries < max_retries)
@@ -867,7 +974,7 @@ def dispatch_inner
 
   # Find next task
   rows = sql_query(db, <<~SQL)
-    SELECT id, description, priority, status, retries, max_retries
+    SELECT id, description, priority, status, retries, max_retries, target_dir, context, acceptance_criteria, scope_boundaries
     FROM tasks
     WHERE status IN ('pending', 'error')
       AND (status = 'pending' OR retries < max_retries)
@@ -903,10 +1010,35 @@ def dispatch_inner
     approval_context = "\n\nPrior approvals for this task:\n#{lines.join("\n")}"
   end
 
+  # Build enriched context sections
+  enriched_sections = ''
+  if task['acceptance_criteria'] && !task['acceptance_criteria'].to_s.empty?
+    enriched_sections += "\n\nAcceptance criteria:\n#{task['acceptance_criteria']}"
+  end
+  if task['scope_boundaries'] && !task['scope_boundaries'].to_s.empty?
+    enriched_sections += "\n\nScope boundaries:\n#{task['scope_boundaries']}"
+  end
+  if task['context'] && !task['context'].to_s.empty?
+    begin
+      ctx = JSON.parse(task['context'])
+      if ctx['business_context']
+        enriched_sections += "\n\nBusiness context:\n#{ctx['business_context']}"
+      end
+      if ctx['files'] && !ctx['files'].empty?
+        enriched_sections += "\n\nRelevant files:\n#{ctx['files'].join("\n")}"
+      end
+      if ctx['search_hints'] && !ctx['search_hints'].empty?
+        enriched_sections += "\n\nSearch hints:\n#{ctx['search_hints'].join("\n")}"
+      end
+    rescue JSON::ParserError
+      enriched_sections += "\n\nContext:\n#{task['context']}"
+    end
+  end
+
   prompt = <<~PROMPT
     You are executing a task from a work queue. Complete the task and report your result.
 
-    Task ##{task_id}: #{task['description']}#{approval_context}
+    Task ##{task_id}: #{task['description']}#{approval_context}#{enriched_sections}
 
     When you are done, end your response with exactly one of these status lines:
     STATUS: DONE — <brief summary of what was accomplished>
@@ -1022,6 +1154,10 @@ def usage
       correct ID --as NAME --notes "..."    Unblock task, write correction to crib
       clarify ID --as NAME --notes "..."    Unblock task, prepend clarification
 
+      add-rich                                Read full task JSON from stdin
+      claim ID --worker WORKER_ID             Claim task for a worker
+      release ID                              Release claimed task
+
       dispatch                              Execute next task via claude -p
       pause                                 Pause dispatch
       resume                                Resume dispatch
@@ -1036,6 +1172,9 @@ case command
 when 'init'          then cmd_init
 when 'doctor'        then cmd_doctor
 when 'add'           then cmd_add(ARGV.dup)
+when 'add-rich'      then cmd_add_rich
+when 'claim'         then cmd_claim(ARGV.dup)
+when 'release'       then cmd_release(ARGV.dup)
 when 'list'          then cmd_list
 when 'next'          then cmd_next
 when 'status'        then cmd_status

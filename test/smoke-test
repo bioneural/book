@@ -273,6 +273,10 @@ else
   fail 'book redirect', "unexpected output: #{new_id_out}"
 end
 
+# Clear the replacement task so it doesn't interfere with subsequent next calls
+replacement_id = new_id_out.strip
+Open3.capture2(fbenv, 'ruby', BOOK_BIN, 'done', replacement_id, err: File::NULL)
+
 # Correct test
 c_id_out, = Open3.capture2(fbenv, 'ruby', BOOK_BIN, 'add', 'correct test', err: File::NULL)
 c_tid = c_id_out.strip
@@ -295,6 +299,9 @@ if correct_status.success?
 else
   fail 'book correct', "exited with #{correct_status.exitstatus}"
 end
+
+# Clear the correct test task so it doesn't interfere with clarify
+Open3.capture2(fbenv, 'ruby', BOOK_BIN, 'done', c_tid, err: File::NULL)
 
 # Clarify test
 cl_id_out, = Open3.capture2(fbenv, 'ruby', BOOK_BIN, 'add', 'clarify test', err: File::NULL)
