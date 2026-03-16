@@ -257,6 +257,12 @@ def migrate_db(db)
   unless task_columns.include?('scope_boundaries')
     db.execute("ALTER TABLE tasks ADD COLUMN scope_boundaries TEXT")
   end
+  unless task_columns.include?('depends_on')
+    db.execute("ALTER TABLE tasks ADD COLUMN depends_on TEXT")
+  end
+  unless task_columns.include?('assigned_to')
+    db.execute("ALTER TABLE tasks ADD COLUMN assigned_to TEXT")
+  end
 rescue SQLite3::Exception => e
   defined?(Spill) ? Spill.warn("migration warning: #{e.message}") : $stderr.puts("book: migration warning: #{e.message}")
 end
@@ -343,13 +349,14 @@ def cmd_add(args)
   context = parse_flag(args, '--context')
   acceptance_criteria = parse_flag(args, '--acceptance-criteria')
   scope_boundaries = parse_flag(args, '--scope-boundaries')
+  assigned_to = parse_flag(args, '--assigned-to')
 
   ensure_db
 
   db = open_db
   result = sql_insert_returning_id(db,
-    "INSERT INTO tasks(description, priority, target_dir, context, acceptance_criteria, scope_boundaries) VALUES (?, ?, ?, ?, ?, ?)",
-    [description, priority.to_i, target_dir, context, acceptance_criteria, scope_boundaries])
+    "INSERT INTO tasks(description, priority, target_dir, context, acceptance_criteria, scope_boundaries, assigned_to) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    [description, priority.to_i, target_dir, context, acceptance_criteria, scope_boundaries, assigned_to])
   db.close
 
   if result.nil?
@@ -381,17 +388,27 @@ def cmd_add_rich
     exit 1
   end
 
+  depends_on = data['depends_on']
+  depends_on_json = if depends_on.is_a?(Array) && !depends_on.empty?
+                      JSON.generate(depends_on.map(&:to_i))
+                    else
+                      nil
+                    end
+
   ensure_db
 
   db = open_db
+  migrate_db(db)
   result = sql_insert_returning_id(db,
-    "INSERT INTO tasks(description, priority, target_dir, context, acceptance_criteria, scope_boundaries) VALUES (?, ?, ?, ?, ?, ?)",
+    "INSERT INTO tasks(description, priority, target_dir, context, acceptance_criteria, scope_boundaries, depends_on, assigned_to) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     [description,
      (data['priority'] || 0).to_i,
      data['target_dir'],
      data['context'].is_a?(Hash) ? JSON.generate(data['context']) : data['context'],
      data['acceptance_criteria'],
-     data['scope_boundaries']])
+     data['scope_boundaries'],
+     depends_on_json,
+     data['assigned_to']])
   db.close
 
   if result.nil?
@@ -446,15 +463,31 @@ def cmd_release(args)
   defined?(Spill) ? Spill.info("task ##{id} released") : $stderr.puts("book: task ##{id} released")
 end
 
-def cmd_list
+def cmd_list(args = [])
   require_db
 
+  assigned_to = parse_flag(args, '--assigned-to')
+
   db = open_db
-  rows = sql_query(db, <<~SQL)
-    SELECT id, description, priority, status, created_at
-    FROM tasks
-    ORDER BY priority DESC, id ASC;
-  SQL
+  migrate_db(db)
+
+  if assigned_to
+    rows = sql_query(db, <<~SQL, [assigned_to])
+      SELECT id, description, priority, status, created_at, depends_on, assigned_to
+      FROM tasks
+      WHERE assigned_to = ?
+      ORDER BY priority DESC, id ASC;
+    SQL
+  else
+    rows = sql_query(db, <<~SQL)
+      SELECT id, description, priority, status, created_at, depends_on, assigned_to
+      FROM tasks
+      ORDER BY priority DESC, id ASC;
+    SQL
+  end
+
+  # Build a set of done task IDs for dependency checking
+  done_ids = sql_query(db, "SELECT id FROM tasks WHERE status = 'done'").map { |r| r['id'] }.to_a
   db.close
 
   if rows.empty?
@@ -462,24 +495,63 @@ def cmd_list
     return
   end
 
-  puts "ID\tPRI\tSTATUS\tDESCRIPTION"
+  puts "ID\tPRI\tSTATUS\tASSIGNED\tDESCRIPTION"
   rows.each do |r|
-    puts "#{r['id']}\t#{r['priority']}\t#{r['status']}\t#{r['description']}"
+    status = r['status']
+    deps = r['depends_on']
+    if deps && !deps.empty? && deps != '[]' && %w[pending error].include?(status)
+      begin
+        dep_ids = JSON.parse(deps)
+        unmet = dep_ids.reject { |id| done_ids.include?(id) }
+        status = "waiting(#{unmet.join(',')})" unless unmet.empty?
+      rescue JSON::ParserError
+        # ignore malformed depends_on
+      end
+    end
+    assigned = r['assigned_to'] || '-'
+    puts "#{r['id']}\t#{r['priority']}\t#{status}\t#{assigned}\t#{r['description']}"
   end
 end
 
-def cmd_next
+def cmd_next(args)
   require_db
 
+  assigned_to = parse_flag(args, '--assigned-to')
+
   db = open_db
-  rows = sql_query(db, <<~SQL)
-    SELECT id, description, priority, status, retries, max_retries, target_dir, context, acceptance_criteria, scope_boundaries
-    FROM tasks
-    WHERE status IN ('pending', 'error')
-      AND (status = 'pending' OR retries < max_retries)
-    ORDER BY priority DESC, id ASC
-    LIMIT 1;
-  SQL
+  migrate_db(db)
+
+  if assigned_to
+    rows = sql_query(db, <<~SQL, [assigned_to])
+      SELECT id, description, priority, status, retries, max_retries, target_dir, context, acceptance_criteria, scope_boundaries, depends_on, assigned_to
+      FROM tasks
+      WHERE status IN ('pending', 'error')
+        AND (status = 'pending' OR retries < max_retries)
+        AND (depends_on IS NULL OR depends_on = '[]'
+             OR NOT EXISTS (
+               SELECT 1 FROM json_each(depends_on) AS dep
+               WHERE dep.value NOT IN (SELECT id FROM tasks WHERE status = 'done')
+             ))
+        AND assigned_to = ?
+      ORDER BY priority DESC, id ASC
+      LIMIT 1;
+    SQL
+  else
+    rows = sql_query(db, <<~SQL)
+      SELECT id, description, priority, status, retries, max_retries, target_dir, context, acceptance_criteria, scope_boundaries, depends_on, assigned_to
+      FROM tasks
+      WHERE status IN ('pending', 'error')
+        AND (status = 'pending' OR retries < max_retries)
+        AND (depends_on IS NULL OR depends_on = '[]'
+             OR NOT EXISTS (
+               SELECT 1 FROM json_each(depends_on) AS dep
+               WHERE dep.value NOT IN (SELECT id FROM tasks WHERE status = 'done')
+             ))
+        AND (assigned_to IS NULL OR assigned_to = '')
+      ORDER BY priority DESC, id ASC
+      LIMIT 1;
+    SQL
+  end
   db.close
 
   if rows.empty?
@@ -999,13 +1071,19 @@ def dispatch_inner
   ensure_db
 
   db = open_db
+  migrate_db(db)
 
-  # Find next task
+  # Find next task (skipping tasks with unfinished dependencies)
   rows = sql_query(db, <<~SQL)
-    SELECT id, description, priority, status, retries, max_retries, target_dir, context, acceptance_criteria, scope_boundaries
+    SELECT id, description, priority, status, retries, max_retries, target_dir, context, acceptance_criteria, scope_boundaries, depends_on
     FROM tasks
     WHERE status IN ('pending', 'error')
       AND (status = 'pending' OR retries < max_retries)
+      AND (depends_on IS NULL OR depends_on = '[]'
+           OR NOT EXISTS (
+             SELECT 1 FROM json_each(depends_on) AS dep
+             WHERE dep.value NOT IN (SELECT id FROM tasks WHERE status = 'done')
+           ))
     ORDER BY priority DESC, id ASC
     LIMIT 1;
   SQL
@@ -1162,9 +1240,10 @@ def usage
 
     Commands:
       init                                  Create database
-      add "description" --priority N        Add a task (prints ID)
-      list                                  All tasks by priority desc
-      next                                  Highest-priority pending/error task
+      add "description" --priority N [--assigned-to NAME]
+                                            Add a task (prints ID)
+      list [--assigned-to NAME]             All tasks by priority desc
+      next [--assigned-to NAME]             Highest-priority pending/error task
       complete ID                           Mark task complete (awaiting evaluation)
       done ID                               Mark task done (evaluation passed or manual override)
       fail ID --reason "..."                Mark task unrecoverably failed
@@ -1204,8 +1283,8 @@ when 'add'           then cmd_add(ARGV.dup)
 when 'add-rich'      then cmd_add_rich
 when 'claim'         then cmd_claim(ARGV.dup)
 when 'release'       then cmd_release(ARGV.dup)
-when 'list'          then cmd_list
-when 'next'          then cmd_next
+when 'list'          then cmd_list(ARGV.dup)
+when 'next'          then cmd_next(ARGV.dup)
 when 'status'        then cmd_status
 when 'done'          then cmd_done(ARGV.dup)
 when 'complete'      then cmd_complete(ARGV.dup)
