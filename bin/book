@@ -419,7 +419,12 @@ def cmd_claim(args)
   require_db
 
   db = open_db
-  sql_exec(db, "UPDATE tasks SET status = 'running', worker_id = ?, claimed_at = datetime('now'), started_at = datetime('now') WHERE id = ?", [worker_id, id.to_i])
+  sql_exec(db, "UPDATE tasks SET status = 'running', worker_id = ?, claimed_at = datetime('now'), started_at = datetime('now') WHERE id = ? AND status IN ('pending', 'error')", [worker_id, id.to_i])
+  if db.changes == 0
+    db.close
+    defined?(Spill) ? Spill.warn("task ##{id} already claimed") : $stderr.puts("book: task ##{id} already claimed")
+    exit 1
+  end
   db.close
 
   defined?(Spill) ? Spill.info("task ##{id} claimed by #{worker_id}") : $stderr.puts("book: task ##{id} claimed by #{worker_id}")
