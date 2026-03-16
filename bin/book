@@ -535,10 +535,16 @@ def cmd_complete(args)
     exit 1
   end
 
+  result_text = parse_flag(args, '--result')
+
   require_db
 
   db = open_db
-  sql_exec(db, "UPDATE tasks SET status = 'complete', completed_at = datetime('now') WHERE id = ?", [id.to_i])
+  if result_text
+    sql_exec(db, "UPDATE tasks SET status = 'complete', completed_at = datetime('now'), result = ? WHERE id = ?", [result_text, id.to_i])
+  else
+    sql_exec(db, "UPDATE tasks SET status = 'complete', completed_at = datetime('now') WHERE id = ?", [id.to_i])
+  end
   db.close
 
   defined?(Spill) ? Spill.info("task ##{id} complete") : $stderr.puts("book: task ##{id} complete")
