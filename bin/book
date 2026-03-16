@@ -15,7 +15,8 @@
 #   book add "description" --priority N        Add a task (prints ID)
 #   book list                                  All tasks by priority desc
 #   book next                                  Highest-priority pending/error task
-#   book done ID                               Mark task completed
+#   book complete ID                           Mark task complete (awaiting eval)
+#   book done ID                               Mark task done (eval passed / manual)
 #   book fail ID --reason "..."                Mark task unrecoverably failed
 #   book error ID --reason "..."               Mark task as retriable failure
 #   book block ID --gate "reason" --action "d" Policy block — creates a review
@@ -520,6 +521,22 @@ def cmd_done(args)
   db.close
 
   defined?(Spill) ? Spill.info("task ##{id} done") : $stderr.puts("book: task ##{id} done")
+end
+
+def cmd_complete(args)
+  id = args.shift
+  if id.nil?
+    defined?(Spill) ? Spill.error("task ID required") : $stderr.puts("book: task ID required")
+    exit 1
+  end
+
+  require_db
+
+  db = open_db
+  sql_exec(db, "UPDATE tasks SET status = 'complete', completed_at = datetime('now') WHERE id = ?", [id.to_i])
+  db.close
+
+  defined?(Spill) ? Spill.info("task ##{id} complete") : $stderr.puts("book: task ##{id} complete")
 end
 
 def cmd_fail(args)
@@ -1041,7 +1058,7 @@ def dispatch_inner
     Task ##{task_id}: #{task['description']}#{approval_context}#{enriched_sections}
 
     When you are done, end your response with exactly one of these status lines:
-    STATUS: DONE — <brief summary of what was accomplished>
+    STATUS: COMPLETE — <brief summary of what was accomplished>
     STATUS: BLOCKED — GATE: <reason> — ACTION: <what needs approval>
     STATUS: ERROR — <what went wrong, will be retried>
     STATUS: FAILED — <what went wrong, unrecoverable>
@@ -1070,10 +1087,10 @@ def dispatch_inner
   last_line = result.lines.last&.strip || ''
 
   case last_line
-  when /\ASTATUS:\s*DONE\b/i
-    sql_exec(db, "UPDATE tasks SET status = 'done', completed_at = datetime('now'), result = ? WHERE id = ?", [result, task_id])
+  when /\ASTATUS:\s*COMPLETE\b/i
+    sql_exec(db, "UPDATE tasks SET status = 'complete', completed_at = datetime('now'), result = ? WHERE id = ?", [result, task_id])
     db.close
-    defined?(Spill) ? Spill.info("task ##{task_id} done") : $stderr.puts("book: task ##{task_id} done")
+    defined?(Spill) ? Spill.info("task ##{task_id} complete") : $stderr.puts("book: task ##{task_id} complete")
 
     # Spawn reflection as a detached background process (fail-open)
     reflect_bin = File.expand_path('../../prophet/bin/reflect', __dir__)
@@ -1117,10 +1134,10 @@ def dispatch_inner
     defined?(Spill) ? Spill.info("task ##{task_id} failed") : $stderr.puts("book: task ##{task_id} failed")
 
   else
-    # No recognized status line — treat as done
-    sql_exec(db, "UPDATE tasks SET status = 'done', completed_at = datetime('now'), result = ? WHERE id = ?", [result, task_id])
+    # No recognized status line — treat as complete
+    sql_exec(db, "UPDATE tasks SET status = 'complete', completed_at = datetime('now'), result = ? WHERE id = ?", [result, task_id])
     db.close
-    defined?(Spill) ? Spill.info("task ##{task_id} done (no status line — assumed complete)") : $stderr.puts("book: task ##{task_id} done (no status line — assumed complete)")
+    defined?(Spill) ? Spill.info("task ##{task_id} complete (no status line — assumed complete)") : $stderr.puts("book: task ##{task_id} complete (no status line — assumed complete)")
   end
 end
 
@@ -1137,7 +1154,8 @@ def usage
       add "description" --priority N        Add a task (prints ID)
       list                                  All tasks by priority desc
       next                                  Highest-priority pending/error task
-      done ID                               Mark task completed
+      complete ID                           Mark task complete (awaiting evaluation)
+      done ID                               Mark task done (evaluation passed or manual override)
       fail ID --reason "..."                Mark task unrecoverably failed
       error ID --reason "..."               Mark task as retriable failure
       block ID --gate "..." --action "..."  Policy block — creates a review
@@ -1179,6 +1197,7 @@ when 'list'          then cmd_list
 when 'next'          then cmd_next
 when 'status'        then cmd_status
 when 'done'          then cmd_done(ARGV.dup)
+when 'complete'      then cmd_complete(ARGV.dup)
 when 'fail'          then cmd_fail(ARGV.dup)
 when 'error'         then cmd_error(ARGV.dup)
 when 'block'         then cmd_block(ARGV.dup)
